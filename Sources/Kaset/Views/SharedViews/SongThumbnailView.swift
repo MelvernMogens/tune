@@ -1,0 +1,99 @@
+import SwiftUI
+
+// MARK: - SongThumbnailSource
+
+struct SongThumbnailSource: Equatable {
+    struct PrimaryFailureKey: Equatable {
+        let videoId: String
+        let url: URL
+    }
+
+    let videoId: String
+    let primaryURL: URL?
+    let fallbackURL: URL?
+
+    var primaryFailureKey: PrimaryFailureKey? {
+        guard let primaryURL, let fallbackURL, primaryURL != fallbackURL else { return nil }
+        return PrimaryFailureKey(videoId: self.videoId, url: primaryURL)
+    }
+
+    func activeURL(failedPrimaryKey: PrimaryFailureKey?) -> URL? {
+        if failedPrimaryKey == self.primaryFailureKey {
+            return self.fallbackURL
+        }
+        return self.primaryURL ?? self.fallbackURL
+    }
+}
+
+// MARK: - SongThumbnailView
+
+/// Displays a song's thumbnail with automatic YouTube fallback.
+/// If the API-provided thumbnail URL fails to load, falls back to
+/// YouTube's public video thumbnail (`i.ytimg.com`).
+struct SongThumbnailView: View {
+    let song: Song
+    var size: CGFloat = 48
+    /// Corner radius; nil picks the Tune scale step for `size` (6 pt up to 40 pt).
+    var cornerRadius: CGFloat?
+
+    @State private var failedPrimaryKey: SongThumbnailSource.PrimaryFailureKey?
+
+    /// The API-provided thumbnail URL.
+    private var primaryURL: URL? {
+        self.song.thumbnailURL?.highQualityThumbnailURL
+    }
+
+    /// YouTube's public video thumbnail as fallback.
+    private var fallbackURL: URL? {
+        self.song.fallbackThumbnailURL
+    }
+
+    private var thumbnailSource: SongThumbnailSource {
+        SongThumbnailSource(
+            videoId: self.song.videoId,
+            primaryURL: self.primaryURL,
+            fallbackURL: self.fallbackURL
+        )
+    }
+
+    /// The URL to display: primary first, fallback only if that exact primary source failed.
+    private var activeURL: URL? {
+        self.thumbnailSource.activeURL(failedPrimaryKey: self.failedPrimaryKey)
+    }
+
+    private var failureHandler: (@MainActor () -> Void)? {
+        let source = self.thumbnailSource
+
+        guard self.activeURL == source.primaryURL,
+              let primaryFailureKey = source.primaryFailureKey
+        else {
+            return nil
+        }
+
+        return {
+            self.failedPrimaryKey = primaryFailureKey
+        }
+    }
+
+    private var targetSize: CGSize {
+        let dimension = max(self.size, 1)
+        return CGSize(width: dimension, height: dimension)
+    }
+
+    var body: some View {
+        CachedAsyncImage(url: self.activeURL, targetSize: self.targetSize, onFailure: self.failureHandler) { image in
+            image
+                .resizable()
+                .scaledToFill()
+        } placeholder: {
+            Rectangle()
+                .fill(TuneTheme.Palette.raised)
+                .overlay {
+                    Image(systemName: "music.note")
+                        .foregroundStyle(TuneTheme.Palette.inkDim)
+                }
+        }
+        .frame(width: self.size, height: self.size)
+        .clipShape(.rect(cornerRadius: self.cornerRadius ?? TuneTheme.Radius.artwork(side: self.size), style: .continuous))
+    }
+}

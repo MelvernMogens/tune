@@ -1,0 +1,68 @@
+# Build artifacts
+.build/
+DerivedData/
+__pycache__/
+*.py[cod]
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.profraw
+
+# Xcode (auto-generated from Package.swift)
+*.xcodeproj/
+!KasetUITests.xcodeproj/
+*.xcworkspace/
+*.xcuserdata/
+xcuserdata/
+
+# Swift Package Manager
+/.swiftpm
+Packages/
+Package.pins
+Package.resolved
+.netrc
+
+# CocoaPods (if ever used)
+Pods/
+
+# Carthage (if ever used)
+Carthage/Build
+Carthage/Checkouts
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Thumbnails
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.p12
+*.key
+
+TEMP_*
+.tmp/
+build/
+.codex/environments/environment.toml
+Build

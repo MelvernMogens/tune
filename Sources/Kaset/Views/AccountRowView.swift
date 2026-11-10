@@ -1,0 +1,206 @@
+// AccountRowView.swift
+// Kaset
+//
+// A single account row component for the account switcher.
+
+import SwiftUI
+
+/// A single account row component displaying account info.
+///
+/// Shows the account avatar, name, handle, account type, and selection state.
+struct AccountRowView: View {
+    let account: UserAccount
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: self.onSelect) {
+            HStack(spacing: 12) {
+                // Avatar
+                self.avatarView
+
+                // Account info
+                VStack(alignment: .leading, spacing: 2) {
+                    // Name
+                    Text(self.account.name)
+                        .font(.body)
+                        .fontWeight(self.isSelected ? .semibold : .regular)
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+
+                    // Handle (if available)
+                    if let handle = account.handle {
+                        Text(handle)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                // Account type
+                self.typeLabel
+
+                // Selection checkmark
+                if self.isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityLabel(String(localized: "Selected"))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(self.rowBackground)
+            .contentShape(.rect(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeInOut(duration: 0.14), value: self.isHovering)
+        .onHover { hovering in
+            self.isHovering = hovering
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(self.accessibilityLabel)
+        .accessibilityAddTraits(self.isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityHint("Double-tap to switch to this account")
+    }
+
+    // MARK: - Avatar View
+
+    private var avatarView: some View {
+        Group {
+            if let thumbnailURL = account.thumbnailURL {
+                CachedAsyncImage(url: thumbnailURL, targetSize: CGSize(width: 40, height: 40)) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    self.avatarPlaceholder
+                }
+            } else {
+                self.avatarPlaceholder
+            }
+        }
+        .frame(width: 40, height: 40)
+        .clipShape(.circle)
+    }
+
+    private var avatarPlaceholder: some View {
+        Circle()
+            .fill(.quaternary)
+            .overlay {
+                Image(systemName: "person.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.tertiary)
+            }
+    }
+
+    // MARK: - Type Label
+
+    private var typeLabel: some View {
+        Text(self.account.typeLabel)
+            .font(.caption2)
+            .fontWeight(.medium)
+            .foregroundStyle(.tertiary)
+            .fixedSize()
+    }
+
+    // MARK: - Background
+
+    @ViewBuilder
+    private var rowBackground: some View {
+        if self.isSelected {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.accentColor.opacity(self.isHovering ? 0.12 : 0.08))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.accentColor.opacity(0.18), lineWidth: 0.5)
+                }
+        } else if self.isHovering {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        } else {
+            Color.clear
+        }
+    }
+
+    // MARK: - Accessibility
+
+    private var accessibilityLabel: String {
+        var label = self.account.name
+
+        if let handle = account.handle {
+            label += ", \(handle)"
+        }
+
+        label += ", \(self.account.typeLabel) account"
+
+        if self.isSelected {
+            label += ", currently selected"
+        }
+
+        return label
+    }
+}
+
+// MARK: - Preview
+
+#Preview("Primary Account - Selected") {
+    let account = UserAccount(
+        id: "primary",
+        name: "John Doe",
+        handle: "@johndoe",
+        brandId: nil,
+        thumbnailURL: URL(string: "https://example.com/avatar.jpg"),
+        isSelected: true
+    )
+
+    AccountRowView(
+        account: account,
+        isSelected: true,
+        onSelect: {}
+    )
+    .frame(width: 280)
+    .padding()
+}
+
+#Preview("Brand Account - Not Selected") {
+    let account = UserAccount(
+        id: "brand123",
+        name: "Music Channel",
+        handle: "@musicchannel",
+        brandId: "brand123",
+        thumbnailURL: nil,
+        isSelected: false
+    )
+
+    AccountRowView(
+        account: account,
+        isSelected: false,
+        onSelect: {}
+    )
+    .frame(width: 280)
+    .padding()
+}
+
+#Preview("Account Without Handle") {
+    let account = UserAccount(
+        id: "nohandle",
+        name: "No Handle User",
+        handle: nil,
+        brandId: nil,
+        thumbnailURL: nil,
+        isSelected: false
+    )
+
+    AccountRowView(
+        account: account,
+        isSelected: false,
+        onSelect: {}
+    )
+    .frame(width: 280)
+    .padding()
+}

@@ -1,0 +1,697 @@
+import Foundation
+import Testing
+@testable import Kaset
+
+/// Tests for the ParsingHelpers.
+@Suite(.tags(.parser))
+struct ParsingHelpersTests {
+    // MARK: - Chart Section Detection
+
+    @Test(
+        "Chart section detection returns true for chart titles",
+        arguments: ["Top Charts", "Weekly Top 50", "Trending Now", "Daily Top 100"]
+    )
+    func isChartSectionWithChart(title: String) {
+        #expect(ParsingHelpers.isChartSection(title) == true)
+    }
+
+    @Test(
+        "Chart section detection returns false for non-chart titles",
+        arguments: ["Quick picks", "New releases", "Recommended"]
+    )
+    func isChartSectionWithNonChart(title: String) {
+        #expect(ParsingHelpers.isChartSection(title) == false)
+    }
+
+    // MARK: - Explicit Badge Detection
+
+    @Test("extractIsExplicit returns true for MUSIC_EXPLICIT_BADGE in badges array")
+    func extractIsExplicitFromBadges() {
+        let data: [String: Any] = [
+            "badges": [
+                [
+                    "musicInlineBadgeRenderer": [
+                        "icon": ["iconType": "MUSIC_EXPLICIT_BADGE"],
+                        "accessibilityData": ["accessibilityData": ["label": "Explicit"]],
+                    ],
+                ],
+            ],
+        ]
+        #expect(ParsingHelpers.extractIsExplicit(from: data) == true)
+    }
+
+    @Test("extractIsExplicit returns true for MUSIC_EXPLICIT_BADGE in subtitleBadges array")
+    func extractIsExplicitFromSubtitleBadges() {
+        let data: [String: Any] = [
+            "subtitleBadges": [
+                [
+                    "musicInlineBadgeRenderer": [
+                        "icon": ["iconType": "MUSIC_EXPLICIT_BADGE"],
+                    ],
+                ],
+            ],
+        ]
+        #expect(ParsingHelpers.extractIsExplicit(from: data) == true)
+    }
+
+    @Test("extractIsExplicit returns false when no badges are present")
+    func extractIsExplicitWithoutBadges() {
+        let data: [String: Any] = [
+            "title": ["runs": [["text": "Some Song"]]],
+        ]
+        #expect(ParsingHelpers.extractIsExplicit(from: data) == false)
+    }
+
+    @Test("extractIsExplicit returns false for non-explicit badge types")
+    func extractIsExplicitWithLiveBadge() {
+        let data: [String: Any] = [
+            "badges": [
+                [
+                    "liveBadgeRenderer": [:],
+                ],
+            ],
+        ]
+        #expect(ParsingHelpers.extractIsExplicit(from: data) == false)
+    }
+
+    // MARK: - URL Normalization
+
+    @Test("Normalize URL adds https to protocol-relative URL")
+    func normalizeURLWithProtocolRelative() {
+        let result = ParsingHelpers.normalizeURL("//example.com/image.jpg")
+        #expect(result == "https://example.com/image.jpg")
+    }
+
+    @Test("Normalize URL preserves full URL")
+    func normalizeURLWithFullURL() {
+        let result = ParsingHelpers.normalizeURL("https://example.com/image.jpg")
+        #expect(result == "https://example.com/image.jpg")
+    }
+
+    // MARK: - Playlist Occurrence ID Extraction
+
+    @Test("Playlist occurrence ID prefers playlistItemData")
+    func extractPlaylistSetVideoIdFromPlaylistItemData() {
+        let data: [String: Any] = [
+            "playlistItemData": ["playlistSetVideoId": "set-direct"],
+            "menu": [
+                "playlistEditEndpoint": [
+                    "actions": [[
+                        "action": "ACTION_REMOVE_VIDEO",
+                        "setVideoId": "set-menu",
+                    ]],
+                ],
+            ],
+        ]
+
+        #expect(ParsingHelpers.extractPlaylistSetVideoId(from: data) == "set-direct")
+    }
+
+    @Test("Playlist occurrence ID falls back to a nested remove endpoint")
+    func extractPlaylistSetVideoIdFromEditEndpoint() {
+        let data: [String: Any] = [
+            "menu": [
+                "menuRenderer": [
+                    "items": [[
+                        "menuServiceItemRenderer": [
+                            "serviceEndpoint": [
+                                "playlistEditEndpoint": [
+                                    "playlistId": "playlist-placeholder",
+                                    "actions": [[
+                                        "action": "ACTION_REMOVE_VIDEO",
+                                        "removedVideoId": "video-placeholder",
+                                        "setVideoId": "set-from-menu",
+                                    ]],
+                                ],
+                            ],
+                        ],
+                    ]],
+                ],
+            ],
+        ]
+
+        #expect(ParsingHelpers.extractPlaylistSetVideoId(from: data) == "set-from-menu")
+    }
+
+    @Test("Playlist occurrence ID does not treat removedVideoId as setVideoId")
+    func extractPlaylistSetVideoIdIgnoresRemovedVideoId() {
+        let data: [String: Any] = [
+            "playlistEditEndpoint": [
+                "actions": [[
+                    "action": "ACTION_REMOVE_VIDEO",
+                    "removedVideoId": "video-placeholder",
+                ]],
+            ],
+        ]
+
+        #expect(ParsingHelpers.extractPlaylistSetVideoId(from: data) == nil)
+    }
+
+    // MARK: - Thumbnail Extraction
+
+    @Test("Extract thumbnails from musicThumbnailRenderer")
+    func extractThumbnailsFromMusicThumbnailRenderer() {
+        let data: [String: Any] = [
+            "thumbnail": [
+                "musicThumbnailRenderer": [
+                    "thumbnail": [
+                        "thumbnails": [
+                            ["url": "//example.com/small.jpg"],
+                            ["url": "//example.com/large.jpg"],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let thumbnails = ParsingHelpers.extractThumbnails(from: data)
+
+        #expect(thumbnails.count == 2)
+        #expect(thumbnails.first == "https://example.com/small.jpg")
+        #expect(thumbnails.last == "https://example.com/large.jpg")
+    }
+
+    @Test("Extract thumbnails from empty data returns empty array")
+    func extractThumbnailsFromEmptyData() {
+        let data: [String: Any] = [:]
+        let thumbnails = ParsingHelpers.extractThumbnails(from: data)
+        #expect(thumbnails.isEmpty)
+    }
+
+    // MARK: - Title Extraction
+
+    @Test("Extract title from standard title key")
+    func extractTitle() {
+        let data: [String: Any] = [
+            "title": [
+                "runs": [
+                    ["text": "Test Title"],
+                ],
+            ],
+        ]
+
+        let title = ParsingHelpers.extractTitle(from: data)
+        #expect(title == "Test Title")
+    }
+
+    @Test("Extract title with custom key")
+    func extractTitleWithCustomKey() {
+        let data: [String: Any] = [
+            "name": [
+                "runs": [
+                    ["text": "Custom Name"],
+                ],
+            ],
+        ]
+
+        let title = ParsingHelpers.extractTitle(from: data, key: "name")
+        #expect(title == "Custom Name")
+    }
+
+    @Test("Extract title from empty data returns nil")
+    func extractTitleFromEmptyData() {
+        let data: [String: Any] = [:]
+        let title = ParsingHelpers.extractTitle(from: data)
+        #expect(title == nil)
+    }
+
+    // MARK: - Artist Extraction
+
+    @Test("Extract artists from subtitle runs")
+    func extractArtists() {
+        let data: [String: Any] = [
+            "subtitle": [
+                "runs": [
+                    ["text": "Artist 1", "navigationEndpoint": ["browseEndpoint": ["browseId": "UC1"]]],
+                    ["text": " & "],
+                    ["text": "Artist 2", "navigationEndpoint": ["browseEndpoint": ["browseId": "UC2"]]],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtists(from: data)
+
+        #expect(artists.count == 2)
+        #expect(artists[0].name == "Artist 1")
+        #expect(artists[0].id == "UC1")
+        #expect(artists[1].name == "Artist 2")
+    }
+
+    @Test("Extract artists filters out separator characters")
+    func extractArtistsFiltersSeparators() {
+        let data: [String: Any] = [
+            "subtitle": [
+                "runs": [
+                    ["text": "Primary Artist"],
+                    ["text": " & "],
+                    ["text": "Guest Artist"],
+                    ["text": ", "],
+                    ["text": "Third Artist"],
+                    ["text": " • "],
+                    ["text": "455M plays"],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtists(from: data)
+
+        #expect(artists.map(\.name) == ["Primary Artist", "Guest Artist", "Third Artist"])
+    }
+
+    @Test("Extract artists from flex columns accepts library artist browse IDs")
+    func extractArtistsFromFlexColumnsWithLibraryArtistBrowseId() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Song Title"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                [
+                                    "text": "Library Artist",
+                                    "navigationEndpoint": [
+                                        "browseEndpoint": [
+                                            "browseId": "MPLAUC1234567890",
+                                        ],
+                                    ],
+                                ],
+                                ["text": " • "],
+                                ["text": "2026"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.count == 1)
+        #expect(artists[0].id == "MPLAUC1234567890")
+        #expect(artists[0].name == "Library Artist")
+    }
+
+    @Test("Extract artists from flex columns preserves linked numeric artist names")
+    func extractArtistsFromFlexColumnsWithLinkedNumericArtistName() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Song Title"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                [
+                                    "text": "311",
+                                    "navigationEndpoint": [
+                                        "browseEndpoint": [
+                                            "browseId": "UC311ArtistChannel",
+                                            "browseEndpointContextSupportedConfigs": [
+                                                "browseEndpointContextMusicConfig": [
+                                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST",
+                                                ],
+                                            ],
+                                        ],
+                                    ],
+                                ],
+                                ["text": " • "],
+                                ["text": "2026"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.count == 1)
+        #expect(artists[0].id == "UC311ArtistChannel")
+        #expect(artists[0].name == "311")
+        #expect(artists[0].profileKind == .artist)
+    }
+
+    @Test("Extract artists from flex columns preserves plain uploaded artist text")
+    func extractArtistsFromFlexColumnsWithPlainUploadedArtistText() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Uploaded Song"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Upload Artist"],
+                                ["text": " • "],
+                                ["text": "Upload Album"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.count == 1)
+        #expect(artists[0].name == "Upload Artist")
+        #expect(artists.allSatisfy { !$0.hasNavigableId })
+    }
+
+    @Test(
+        "Content type labels are not treated as plain artist names",
+        arguments: ["Audiobook", "Single", "EP", "Profile", "Podcast Episode"]
+    )
+    func contentTypeLabelsAreNotPlainArtists(label: String) {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Fixture Result"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": label],
+                                ["text": " • "],
+                                ["text": "Fixture Creator"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.map(\.name) == ["Fixture Creator"])
+    }
+
+    @Test("Middle-dot separators are excluded from plain artist fallback")
+    func middleDotSeparatorsAreNotArtists() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Fixture Video"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Video"],
+                                ["text": " · "],
+                                ["text": "Fixture Creator"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.map(\.name) == ["Fixture Creator"])
+    }
+
+    // MARK: - Video ID Extraction
+
+    @Test("Extract video ID from playlistItemData")
+    func extractVideoIdFromPlaylistItemData() {
+        let data: [String: Any] = [
+            "playlistItemData": ["videoId": "abc123"],
+        ]
+
+        let videoId = ParsingHelpers.extractVideoId(from: data)
+        #expect(videoId == "abc123")
+    }
+
+    @Test("Extract video ID from watchEndpoint")
+    func extractVideoIdFromWatchEndpoint() {
+        let data: [String: Any] = [
+            "navigationEndpoint": [
+                "watchEndpoint": ["videoId": "xyz789"],
+            ],
+        ]
+
+        let videoId = ParsingHelpers.extractVideoId(from: data)
+        #expect(videoId == "xyz789")
+    }
+
+    @Test("Extract video ID from overlay")
+    func extractVideoIdFromOverlay() {
+        let data: [String: Any] = [
+            "overlay": [
+                "musicItemThumbnailOverlayRenderer": [
+                    "content": [
+                        "musicPlayButtonRenderer": [
+                            "playNavigationEndpoint": [
+                                "watchEndpoint": ["videoId": "overlay123"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let videoId = ParsingHelpers.extractVideoId(from: data)
+        #expect(videoId == "overlay123")
+    }
+
+    // MARK: - Browse ID Extraction
+
+    @Test("Extract browse ID from navigation endpoint")
+    func extractBrowseId() {
+        let data: [String: Any] = [
+            "navigationEndpoint": [
+                "browseEndpoint": ["browseId": "VLPL12345"],
+            ],
+        ]
+
+        let browseId = ParsingHelpers.extractBrowseId(from: data)
+        #expect(browseId == "VLPL12345")
+    }
+
+    // MARK: - Duration Parsing
+
+    @Test(
+        "Parse duration string to seconds",
+        arguments: [
+            ("3:45", 225.0), // 3 * 60 + 45
+            ("1:30:00", 5400.0), // 1 * 3600 + 30 * 60
+        ]
+    )
+    func parseDuration(input: String, expectedSeconds: TimeInterval) {
+        let duration = ParsingHelpers.parseDuration(input)
+        #expect(duration == expectedSeconds)
+    }
+
+    @Test("Parse invalid duration returns nil")
+    func parseDurationInvalid() {
+        let duration = ParsingHelpers.parseDuration("invalid")
+        #expect(duration == nil)
+    }
+
+    @Test(
+        "Extract duration from accessibility overlay labels",
+        arguments: [
+            ("Play Song by Artist, 4 minutes, 55 seconds", 295.0),
+            ("Play Song, 1 minute, 1 second", 61.0),
+            ("Play Song, 45 seconds", 45.0),
+            ("Play Song, 4 minutes", 240.0),
+        ]
+    )
+    func extractDurationFromAccessibilityOverlayLabel(label: String, expectedSeconds: TimeInterval) {
+        let duration = ParsingHelpers.extractDurationFromFlexColumns(self.makeAccessibilityOverlayRow(label: label))
+        #expect(duration == expectedSeconds)
+    }
+
+    // MARK: - Flex Column Extraction
+
+    @Test("Extract title from flex columns")
+    func extractTitleFromFlexColumns() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [["text": "Song Title"]],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let title = ParsingHelpers.extractTitleFromFlexColumns(data)
+        #expect(title == "Song Title")
+    }
+
+    @Test("Extract subtitle from flex columns")
+    func extractSubtitleFromFlexColumns() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Title"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Artist"],
+                                ["text": " • "],
+                                ["text": "Album"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let subtitle = ParsingHelpers.extractSubtitleFromFlexColumns(data)
+        #expect(subtitle == "Artist • Album")
+    }
+
+    @Test("Join run text skips missing text without intermediate arrays")
+    func joinedRunTextSkipsMissingText() {
+        let runs: [[String: Any]] = [
+            ["text": "First"],
+            ["navigationEndpoint": ["browseEndpoint": ["browseId": "UC123"]]],
+            ["text": " Second"],
+        ]
+
+        #expect(ParsingHelpers.joinedRunText(runs) == "First Second")
+    }
+
+    @Test("Extract artists from flex columns")
+    func extractArtistsFromFlexColumns() {
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Title"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Artist Name", "navigationEndpoint": ["browseEndpoint": ["browseId": "UC123"]]],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let artists = ParsingHelpers.extractArtistsFromFlexColumns(data)
+
+        #expect(artists.count == 1)
+        #expect(artists.first?.name == "Artist Name")
+        #expect(artists.first?.id == "UC123")
+    }
+
+    // MARK: - Duration from Flex Columns (Artist Page)
+
+    @Test("Extract duration from combined flex column runs (artist top songs)")
+    func extractDurationFromCombinedFlexRuns() {
+        // Artist page top songs have duration as the last run in a combined flex column:
+        // "Artist • Album • 4:55"
+        let data: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [["text": "Billie Jean"]]],
+                    ],
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Michael Jackson", "navigationEndpoint": ["browseEndpoint": ["browseId": "UC123"]]],
+                                ["text": " • "],
+                                ["text": "Thriller", "navigationEndpoint": ["browseEndpoint": ["browseId": "MPRE456"]]],
+                                ["text": " • "],
+                                ["text": "4:55"],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+
+        let duration = ParsingHelpers.extractDurationFromFlexColumns(data)
+        #expect(duration == 295.0) // 4 * 60 + 55
+    }
+
+    @Test("Linked duration-looking flex run is skipped")
+    func extractDurationSkipsLinkedDurationLookingRun() {
+        let data: [String: Any] = [
+            "flexColumns": [[
+                "musicResponsiveListItemFlexColumnRenderer": [
+                    "text": [
+                        "runs": [[
+                            "text": "4:44",
+                            "navigationEndpoint": ["browseEndpoint": ["browseId": "MPRE444"]],
+                        ]],
+                    ],
+                ],
+            ]],
+        ]
+
+        let duration = ParsingHelpers.extractDurationFromFlexColumns(data)
+        #expect(duration == nil)
+    }
+
+    @Test("Unlinked duration after linked numeric title is extracted")
+    func extractDurationUsesUnlinkedDurationAfterLinkedRun() {
+        let data: [String: Any] = [
+            "flexColumns": [[
+                "musicResponsiveListItemFlexColumnRenderer": [
+                    "text": [
+                        "runs": [
+                            [
+                                "text": "4:44",
+                                "navigationEndpoint": ["browseEndpoint": ["browseId": "MPRE444"]],
+                            ],
+                            ["text": "3:21"],
+                        ],
+                    ],
+                ],
+            ]],
+        ]
+
+        let duration = ParsingHelpers.extractDurationFromFlexColumns(data)
+        #expect(duration == 201.0)
+    }
+
+    private func makeAccessibilityOverlayRow(label: String) -> [String: Any] {
+        [
+            "overlay": [
+                "musicItemThumbnailOverlayRenderer": [
+                    "content": [
+                        "musicPlayButtonRenderer": [
+                            "accessibilityPlayData": [
+                                "accessibilityData": ["label": label],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+    }
+}

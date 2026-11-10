@@ -1,0 +1,1323 @@
+# Architecture & Services
+
+This document provides detailed information about Kaset's architecture, services, and design patterns. Kaset now has two parallel content sources over the same Google login: YouTube Music (`.music`, default) and regular YouTube (`.video`). Shared infrastructure handles auth, settings, caching, images, and media keys; source-specific clients, models, parsers, view models, and playback WebViews keep the two experiences isolated.
+
+## Core Structure
+
+The codebase follows a clean architecture pattern:
+
+```
+Sources/
+  └── Kaset/            → Main app target
+      ├── KasetApp.swift    → App entry point
+      ├── AppDelegate.swift → Window lifecycle
+      ├── Models/       → Data types (Song, Playlist, Album, Artist, etc.)
+      ├── Services/     → Business logic
+      │   ├── API/      → YTMusicClient, YouTubeClient, Parsers/
+      │   ├── Audio/    → EqualizerService, EqualizerAudioEngine, ProcessTapHelper, BiquadFilter
+      │   ├── Auth/     → AuthService (login state machine)
+      │   ├── Library/  → Library identity and optimistic reconciliation modules
+      │   ├── Player/   → PlayerService, YouTubePlayerService, PlaybackArbiter, NowPlayingManager, queue metadata and album playback actions
+      │   ├── Scripting/→ ScriptCommands (AppleScript integration)
+      │   ├── WebKit/   → WebKitManager (cookie persistence)
+      │   └── HapticService.swift → Force Touch trackpad haptic feedback
+      ├── ViewModels/   → State management (music view models plus YouTube/ video-source view models)
+      ├── Utilities/    → Helpers (DiagnosticsLogger, extensions)
+      └── Views/        → SwiftUI views (MainWindow, Sidebar, PlayerBar, YouTube views, etc.)
+  ├── APIExplorer/      → API explorer CLI tool
+  └── YouTubeAskCore/   → Foundation-only Ask wire decoding, strict parsing, sanitization, and request construction
+Tests/                  → Unit tests (`KasetTests/` and isolated `YouTubeAskCoreTests/`)
+docs/                   → Documentation
+  └── adr/              → Architecture Decision Records
+```
+
+## Service Protocols
+
+All major services have protocol definitions for testability:
+
+```swift
+// Sources/Kaset/Services/Protocols.swift
+protocol YTMusicClientProtocol: Sendable { ... }
+protocol AuthServiceProtocol { ... }
+protocol PlayerServiceProtocol { ... }
+
+// Sources/Kaset/Services/YouTubeProtocols.swift
+protocol YouTubeClientProtocol: Sendable { ... }
+```
+
+ViewModels accept protocols via dependency injection with default implementations:
+
+```swift
+@MainActor @Observable
+final class HomeViewModel {
+    private let client: YTMusicClientProtocol
+
+    init(client: YTMusicClientProtocol = YTMusicClient.shared) {
+        self.client = client
+    }
+}
+```
+
+YouTube view models follow the same pattern with `YouTubeClientProtocol` and live under `Sources/Kaset/ViewModels/YouTube/`. `YouTubeViewModelStore` keeps the YouTube navigation stack and view-model caches warm while the user switches back to Music. Watch-scoped Ask state is deliberately excluded from that store: `YouTubeWatchViewModel` owns a child `YouTubeAskViewModel`, so opaque conversation state cannot survive route destruction or a source/account boundary.
+
+## State Management
+
+- **Source of Truth**: Services are `@MainActor @Observable` singletons
+- **Environment Injection**: Views access services via `@Environment`
+- **Cookie Persistence**: `WKWebsiteDataStore` with persistent identifier
+
+### Library State Reconciliation
+
+`LibraryViewModel` owns observable Library UI state, while `LibraryContentReconciler` owns optimistic add/remove reconciliation for eventually-consistent YouTube Music Library responses. `LibraryMutationActions` owns mutation orchestration: calling YouTube Music, invalidating stale caches, applying optimistic state, and scheduling delayed reconciliation when backend snapshots lag. This keeps pending mutation stabilization rules behind small Library interfaces instead of spreading them across view models and action helpers.
+
+### YouTube Ask State Boundary
+
+Ask Gemini uses a route-owned, memory-only state machine. Visible messages and local suggestion IDs are separated from opaque server commands. The canonical eligible `next` panel may supply the opaque free-text command directly. When it does not, the client may send the prompt-free initial `get_panel` continuation and accept a confirmed materialized command; if both stages provide commands, they must match exactly. One action consumes each bound conversation revision. A successful response advances the revision and retains the validated composer command unless YouTube supplies a replacement; uncertain failures discard it and require New Chat. Continuation and click-tracking values are never exposed to the UI. Hidden state is bound to the video ID, authentication generation, confirmed primary-account scope, local conversation ID, and revision. Navigation away, source/account/authentication changes, cancellation, or view-model destruction invalidates the operation and discards both visible and opaque conversation state. Nothing is written to `APICache`, UserDefaults, Keychain, navigation restoration, telemetry, or logs. See [ADR-0032](adr/0032-youtube-ask-gemini.md).
+
+## Key Services
+
+### WebKitManager
+
+**File**: `Sources/Kaset/Services/WebKit/WebKitManager.swift`
+
+Manages WebKit infrastructure for the app:
+
+- Owns a persistent `WKWebsiteDataStore` for runtime cookie storage
+- Backs up auth cookies to **macOS Keychain** for persistence across app updates
+- Provides cookie access via `getAllCookies()`
+- Observes cookie changes via `WKHTTPCookieStoreObserver`
+- Creates WebView configurations with shared data store
+
+```swift
+@MainActor @Observable
+final class WebKitManager {
+    static let shared = WebKitManager()
+
+    func getAllCookies() async -> [HTTPCookie]
+    func createWebViewConfiguration() -> WKWebViewConfiguration
+}
+```
+
+### AuthService
+
+**File**: `Sources/Kaset/Services/Auth/AuthService.swift`
+
+Manages authentication state:
+
+| State | Description |
+|-------|-------------|
+| `.loggedOut` | No valid session |
+| `.loggingIn` | Login sheet presented |
+| `.loggedIn` | Valid `__Secure-3PAPISID` cookie found |
+
+**Key Methods**:
+- `checkLoginStatus()` — Checks cookies for valid session
+- `startLogin()` — Presents login sheet
+- `sessionExpired()` — Handles 401/403 from API
+- Authentication-boundary cleanup — Account session mutations are fenced and drained before sign-out or reauthentication clears/samples shared WebKit cookies
+
+### YTMusicClient
+
+**File**: `Sources/Kaset/Services/API/YTMusicClient.swift`
+
+Makes authenticated requests to YouTube Music's internal API:
+
+- Computes `SAPISIDHASH` authorization per request
+- Uses browser-style headers to avoid bot detection
+- Throws `YTMusicError.authExpired` on 401/403
+- Delegates response parsing to modular parsers
+
+**Endpoints**:
+- `getHome()` → Home page sections (with pagination via `getHomeContinuation()`)
+- `getExplore()` → Explore page (new releases, charts, moods)
+- `search(query:)` → Search results
+- `getLibraryPlaylists()` → User's playlists
+- `getLibraryContent()` → User's playlists, saved albums, followed artists, podcasts, and uploads
+- `getLikedSongs()` → User's liked songs (with pagination via `getLikedSongsContinuation()`)
+- `getPlaylist(id:)` → Playlist details (with pagination via `getPlaylistContinuation()`)
+- `getPlaylistAllTracks(playlistId:)` → All tracks via queue API (for radio playlists)
+- `getArtist(id:)` → Artist details with songs and albums
+- `getLyrics(videoId:)` → Lyrics for a track (two-step: next → browse)
+- `rateSong(videoId:rating:)` → Like/dislike a song
+- `subscribeToArtist(channelId:)` → Subscribe to an artist
+- `unsubscribeFromArtist(channelId:)` → Unsubscribe from an artist
+- `subscribeToPlaylist(playlistId:)` → Add playlist to library
+- `unsubscribeFromPlaylist(playlistId:)` → Remove playlist from library
+- `deletePlaylist(playlistId:)` → Delete a user-owned playlist
+- `getAddToPlaylistOptions(videoId:)` → Fetch the signed-in user's add-to-playlist menu
+- `addSongToPlaylist(videoId:playlistId:allowDuplicate:)` → Add one song to an existing playlist via `browse/edit_playlist`
+- `createPlaylist(title:description:privacyStatus:videoIds:)` → Create a playlist and optionally seed it with songs
+
+### YouTubeClient
+
+**File**: `Sources/Kaset/Services/API/YouTubeClient.swift`
+
+Makes authenticated requests to regular YouTube's internal InnerTube API. It deliberately mirrors `YTMusicClient`'s scaffolding while keeping the origin, client identity, models, and parsers separate:
+
+- Uses `https://www.youtube.com` for `SAPISIDHASH`, `Origin`, `Referer`, and `X-Origin`
+- Uses the `WEB` InnerTube client instead of YouTube Music's `WEB_REMIX`
+- Prefixes shared `APICache` keys with `yt:` so video-source entries do not collide with Music cache invalidation
+- Delegates normal response parsing to YouTube-specific parsers under `Services/API/Parsers/YouTube/`
+- Routes Ask Gemini through an isolated bounded, same-origin, no-cache, no-automatic-retry transport backed by `YouTubeAskCore`; generic YouTube request behavior is unchanged
+
+**Endpoints / surfaces**:
+- `getHomeBundle()` / `getHomeFeed()` → Recommendations, chips, shelves, and pagination
+- `search(query:filter:)` → Videos, channels, and playlists
+- `getWatchNext(videoId:)` → Watch metadata, related videos, channel state, and comment continuation for playback/scrobbling callers
+- `getWatchPage(videoId:)` → The same watch data plus an optional strictly parsed Ask bootstrap from one `next` request
+- `loadAskConversation(from:)`, `continueAskConversation(_:selecting:)` → Initial Ask panel and exact server-issued chip continuations through `get_panel`
+- `getComments(continuation:)`, `postComment(...)`, `performCommentAction(...)` → Watch-page comments
+- `getChannel(channelId:)`, `getPlaylist(playlistId:)`, `getDestinationFeed(_:)`, `getShorts()` → Browse surfaces
+- `getSubscriptionsFeed()`, `getSubscribedChannels()`, `getHistory(forceRefresh:)`, `getUserPlaylists()` → Signed-in YouTube surfaces
+- `rateVideo(...)`, `setSubscribed(...)`, `addToWatchLater(...)`, `removeFromWatchLater(...)` → Mutations
+
+Ask operations require a signed-in primary account. The production app explicitly selects the fixed WEB request profile; strict parser, identity, and transport failures still fail closed per conversation. See [youtube.md](youtube.md) for the product surface, [ADR-0032](adr/0032-youtube-ask-gemini.md) for the activation decision, and the [API discovery record](api-discovery.md#youtube-ask-gemini--youchat-investigation-2026-07-27) for wire-level observations.
+
+### API Parsers
+
+**Directory**: `Sources/Kaset/Services/API/Parsers/`
+
+Response parsing is extracted into specialized modules:
+
+| Parser | Purpose |
+|--------|---------|
+| `ParsingHelpers.swift` | Shared utilities (thumbnails, artists, duration) |
+| `ResponseTreeSearch.swift` | Recursive search helpers for nested YouTube Music response trees |
+| `HomeResponseParser.swift` | Home/Explore page sections |
+| `SearchResponseParser.swift` | Search results |
+| `LibraryContentParser.swift` | Library browse content, including playlists, saved albums, followed artists, podcast shows, and uploaded-song virtual tile parsing |
+| `PlaylistEditability.swift` | Playlist ownership/delete affordance detection |
+| `PlaylistParser.swift` | Playlist details, queue tracks, pagination, add-to-playlist menu options, and create-playlist IDs |
+| `ArtistParser.swift` | Artist details (songs, albums, subscription status) |
+| `RadioQueueParser.swift` | Radio queue from "next" endpoint |
+| `SongMetadataParser.swift` | Full song metadata with feedback tokens |
+| `LyricsParser.swift` | Lyrics extraction |
+| `YouTube/` | Regular YouTube feed, search, watch-next, comments, channel, playlist, guide, and renderer parsers |
+
+`YouTubeAskCore` is a separate Foundation-only target rather than another recursive app parser. It owns the bounded JSON/XSSI/NDJSON/length-prefixed wire decoder, strict YouChat bootstrap/chip/message parser, visible-text sanitizer, opaque command carrier, and direct-chip request builder. The app and API Explorer consume the same package-scoped contract; API Explorer-only reporting and live-action confirmation stay outside the core.
+
+**Design**: Static enum-based parsers with pure functions for testability. Ask parsing is schema-directed and fail-closed rather than broad recursive discovery.
+
+### Queue Song Metadata and Album Playback
+
+`QueueSongMetadata` prepares song values before they enter the native queue, centralizing artist cleanup and fallback album/thumbnail rules. `AlbumPlaybackActions` owns album-specific fetch/queue/play workflows so SwiftUI action helpers do not duplicate album-track enrichment logic. `PlaylistPlaybackActions` owns playlist playback, radio queue fallback, playlist-artwork fallback, and continuation append/cancel behavior.
+
+### PlayerService
+
+**File**: `Sources/Kaset/Services/Player/PlayerService.swift`
+
+Controls YouTube Music audio playback via the singleton Music WebView:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `currentTrack` | `Song?` | Currently playing track |
+| `isPlaying` | `Bool` | Playback state |
+| `progress` | `Double` | Current position (seconds) |
+| `duration` | `Double` | Track length (seconds) |
+| `pendingPlayVideoId` | `String?` | Video ID to play |
+| `showMiniPlayer` | `Bool` | Mini player visibility |
+| `showLyrics` | `Bool` | Lyrics panel visibility |
+| `shuffleMode` | `ShuffleMode` | Tri-state shuffle (`off` / `on` / `smart`) |
+| `shuffleEnabled` | `Bool` | Computed shim, `true` when `shuffleMode != .off` |
+
+**Key Methods**:
+- `play(videoId:)` — Loads and plays a video
+- `play(song:)` — Plays a Song model
+- `confirmPlaybackStarted()` — Dismisses mini player
+- `toggleShuffle()` — Binary on↔off shuffle (menu ⌘S, mini player, AppleScript, AI)
+- `cycleShuffleMode()` — Player-bar control cycling off→on→smart→off (skips smart when disabled in settings)
+
+Smart Shuffle is implemented in `PlayerService+SmartShuffle.swift` as a rolling
+recommendation window (pure helpers `nextSuggestionSlot`, `dedupeSuggestions`,
+`stripSuggested` plus async `fillSmartShuffleWindow`). See
+[ADR-0025: Smart Shuffle](adr/0025-smart-shuffle.md) and
+[docs/playback.md](playback.md#smart-shuffle) for details.
+
+### SingletonPlayerWebView
+
+**File**: `Sources/Kaset/Views/MiniPlayerWebView.swift`
+
+Manages the singleton WebView for YouTube Music playback:
+
+- Creates exactly ONE WebView for app lifetime
+- Handles video loading with pause-before-load
+- JavaScript bridge for playback state updates
+- Survives window close for background audio
+
+```swift
+@MainActor
+final class SingletonPlayerWebView {
+    static let shared = SingletonPlayerWebView()
+
+    func getWebView(webKitManager:, playerService:) -> WKWebView
+    func loadVideo(videoId: String)
+}
+```
+
+### YouTubePlayerService and YouTubeWatchWebView
+
+**Files**:
+- `Sources/Kaset/Services/Player/YouTubePlayerService.swift`
+- `Sources/Kaset/Views/YouTube/YouTubeWatchWebView.swift`
+
+Control regular YouTube video playback through a separate singleton watch WebView. The WebView loads `www.youtube.com/watch?v={videoId}`, extracts the video surface for inline/floating presentation, and reports playback state, captions, quality, ad state, and timing back to Swift.
+
+`YouTubePlayerService.surfaceLocation` tracks where the extracted video currently lives:
+
+| Surface | Description |
+|---------|-------------|
+| `.inline` | Docked in `YouTubeWatchView` |
+| `.floating` | Hosted by `YouTubeVideoWindowController` |
+| `.none` | No active YouTube playback surface |
+
+### PlaybackArbiter
+
+**File**: `Sources/Kaset/Services/Player/PlaybackArbiter.swift`
+
+Coordinates the two playback services so Music and YouTube do not play over each other. When one source starts, the arbiter pauses the other source; `NowPlayingManager` uses the arbiter's active/last-played source to route media keys.
+
+### NowPlayingManager
+
+**File**: `Sources/Kaset/Services/Player/NowPlayingManager.swift`
+
+Remote command center integration for media key support:
+
+- Registers `MPRemoteCommandCenter` handlers
+- Handles media keys (play/pause, next, previous, seek)
+- Routes commands to `PlayerService` / `YouTubePlayerService` based on the active source
+- Admits App Intents transport commands through the same ingress (`handleAppIntentCommand`)
+- For music, publishes playback state only: WebKit's card is the single Kaset entry, and the state keeps the Play key on Kaset after a pause. YouTube video publishes a tagged minimal entry (title, channel) ([ADR-0042](adr/0042-single-now-playing-entry.md))
+- The music page forwards its play and pause media-session actions (and next/previous in the next/previous control style) over the bridge (`REMOTE_*`), and they go through the same native transport queue as media keys
+
+**Note**: Now Playing display for music (track info, artwork) is handled natively by WKWebView's Media Session API. This provides better integration with YouTube Music artwork.
+
+### HapticService
+
+**File**: `Sources/Kaset/Services/HapticService.swift`
+
+Provides tactile feedback on Macs with Force Touch trackpads:
+
+| Feedback Type | Pattern | Used For |
+|---------------|---------|----------|
+| `.playbackAction` | `.generic` | Play, pause, skip |
+| `.toggle` | `.alignment` | Shuffle, repeat, like/dislike |
+| `.sliderBoundary` | `.levelChange` | Volume/seek at 0% or 100% |
+| `.navigation` | `.alignment` | Sidebar selection |
+| `.success` | `.generic` | Add to library, search submit |
+| `.error` | `.generic` | Action failures |
+
+**Accessibility**: Respects user preference (Settings → General) and system "Reduce Motion" setting.
+
+### FavoritesManager
+
+**File**: `Sources/Kaset/Services/FavoritesManager.swift`
+
+Manages user-curated Favorites section on Home view:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `items` | `[FavoriteItem]` | Ordered list of pinned items |
+| `isVisible` | `Bool` | `true` when items exist |
+
+**Supported Item Types**: Song, Album, Playlist, Artist
+
+**Key Methods**:
+- `add(_:)` — Adds item to front of list (no duplicates)
+- `remove(contentId:)` — Removes by videoId/browseId
+- `toggle(_:)` — Adds if not pinned, removes if pinned
+- `move(from:to:)` — Reorders via drag-and-drop
+- `isPinned(contentId:)` — Checks if item is in Favorites
+- `setActiveAccountScopeID(_:)` — Switches signed-in scope; `nil` clears the visible list (sign-out)
+- `enterGuestMode()` / `exitGuestMode()` — Use a separate guest scope and restore the last signed-in scope; account switching keeps guest data visible and grants only the account-list refresh scoped access to the preserved session until commit
+
+**Persistence**:
+- **Location**: `~/Library/Application Support/Kaset/favorites-<opaqueScopeId>.json`
+- **Scope**: SHA-256-derived from a local canonical owner UUID plus the selected primary/brand account ID; guest is separate
+- **Owner identity**: A local owner UUID is bound to hashed auth and email fingerprints in `UserDefaults` plus an atomic Application Support backup manifest; raw credentials and email are never persisted, while account IDs remain only for scope derivation and migration bookkeeping
+- **Format**: JSON-encoded `[FavoriteItem]`
+- **Writes**: Debounced async; flushed before account switch
+- **Account discovery**: Credential aliases remain inactive until a matching email corroborates the owner in the current auth generation; staged prepare/commit/finalize migration reconciles auth and email fingerprints, and persisted pending-finalization records resume interrupted cleanup
+- **Reads**: Deferred until account discovery selects a scope; signed-out state has no persistence target
+- **Upgrade**: Old shared `favorites.json` is claimed by the first resolved scope, and every prior `favorites-<accountId>.json` file in the verified account list is atomically claimed by its corresponding opaque scope so interrupted cleanup cannot replay it into another user
+
+**Related Files**:
+- `Sources/Kaset/Models/FavoriteItem.swift` — Data model with `ItemType` enum
+- `Sources/Kaset/Views/SharedViews/FavoritesSection.swift` — Horizontal scrolling UI
+- `Sources/Kaset/Views/SharedViews/FavoritesContextMenu.swift` — Shared context menu items
+
+### NotificationService
+
+**File**: `Sources/Kaset/Services/Notification/NotificationService.swift`
+
+Posts local notifications when the current track changes:
+
+- Observes `PlayerService.currentTrack` for changes
+- Posts silent alerts with track title and artist
+- Respects user preference via `SettingsManager.showNowPlayingNotifications`
+- Requests notification authorization on init
+
+**Usage**: Instantiated in `MainWindow` and kept alive for app lifetime.
+
+### NetworkMonitor
+
+**File**: `Sources/Kaset/Services/NetworkMonitor.swift`
+
+Monitors network connectivity using `NWPathMonitor`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `isConnected` | `Bool` | Whether network is available |
+| `isExpensive` | `Bool` | Cellular or hotspot connection |
+| `isConstrained` | `Bool` | Low Data Mode enabled |
+| `interfaceType` | `InterfaceType` | WiFi, cellular, wired, etc. |
+| `statusDescription` | `String` | Human-readable status |
+
+**Note**: Uses `DispatchQueue` for `NWPathMonitor` callbacks (no async/await API from Apple).
+
+### SettingsManager
+
+**File**: `Sources/Kaset/Services/SettingsManager.swift`
+
+Manages user preferences persisted via `UserDefaults`:
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `showNowPlayingNotifications` | `Bool` | `true` | Track change notifications |
+| `defaultLaunchPage` | `LaunchPage` | `.home` | Initial page on app launch |
+| `appSource` | `AppSource` | `.music` | Active source toggle (`.music` for YouTube Music, `.video` for regular YouTube) |
+| `hapticFeedbackEnabled` | `Bool` | `true` | Force Touch feedback |
+| `rememberPlaybackSettings` | `Bool` | `false` | Persist shuffle/repeat state |
+| `syncedLyricsEnabled` | `Bool` | `true` | Enable synced lyrics provider lookup before plain lyrics fallback |
+| `popOutVideoOnNavigateAway` | `Bool` | `true` | Pop a playing YouTube video into the floating window when navigating away; when off, playback stops |
+| `showYouTubeControlsOnVideo` | `Bool` | `false` | Overlay the YouTube player bar on the docked watch-page video (auto-hiding while playing) instead of the bottom bar; other YouTube pages except Shorts drop the bottom bar |
+
+**Music LaunchPage Options**: Home, Explore, Charts, Moods & Genres, New Releases, Liked Music, Playlists, Last Used
+
+### EqualizerService
+
+**File**: `Sources/Kaset/Services/Audio/EqualizerService.swift`
+
+Owns the equalizer feature's user-facing state and lifecycle. The actual DSP runs in ``EqualizerAudioEngine`` via an `AudioDeviceIOProc` registered on an aggregate device that wraps a Core Audio process tap on WebKit's GPU subprocess. See [ADR-0017](adr/0017-equalizer.md) for the full architecture rationale.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `settings` | `EQSettings` | Active band gains, preamp, preset, enabled flag — persisted as JSON in UserDefaults |
+| `status` | `Status` | Computed engine status (`off` / `active` / `standby` / `permissionNeeded` / `error`) surfaced to the settings UI |
+| `lastFailure` | `StartFailure?` | Last raw engine failure; the UI reads it via `status` rather than directly |
+
+**Persistence**: Every mutation triggers a JSON round-trip under the `settings.equalizer` UserDefaults key. The full settings shape (isEnabled, preampDB, bandGainsDB, preset) restores on next launch.
+
+**Engine seam**: `EqualizerAudioEngineProtocol` lets tests inject a no-op stub so `EqualizerServiceTests` can verify state transitions without touching Core Audio.
+
+> ⚠️ **Naming note**: `Sources/Kaset/Views/SharedViews/EqualizerView.swift` is unrelated — it's a small now-playing animation indicator (three bouncing bars). The settings UI is `EqualizerSettingsView`.
+
+### SyncedLyricsService
+
+**File**: `Sources/Kaset/Services/Lyrics/SyncedLyricsService.swift`
+
+Coordinates synced and plain lyrics resolution for the current track:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `currentLyrics` | `LyricResult` | Currently displayed `.synced`, `.plain`, or `.unavailable` lyrics |
+| `activeProvider` | `String?` | Provider/source label surfaced in the lyrics UI |
+| `isLoading` | `Bool` | Whether synced provider search is currently running |
+
+**Key Behaviors**:
+- Searches all registered `LyricsProvider` implementations concurrently using `LyricsSearchInfo`
+- Ships with `LRCLibProvider` as the default synced lyrics source and parses LRC payloads with `LRCParser`
+- Caches results in memory by `videoId` and can upgrade cached plain lyrics when synced lyrics become available later
+- Uses `fetchGeneration` to ignore stale async completions when the user changes tracks quickly
+- Preserves plain lyrics fallback state until a higher-quality synced result is resolved
+
+**Related Files**:
+- `Sources/Kaset/Services/Lyrics/LyricsProvider.swift` — Provider protocol and search model
+- `Sources/Kaset/Services/Lyrics/Providers/LRCLibProvider.swift` — External synced lyrics provider
+- `Sources/Kaset/Services/API/Parsers/LRCParser.swift` — LRC to `SyncedLyrics` parser
+
+**Integration**: Created once in `KasetApp` and injected through the SwiftUI environment for lyrics views.
+
+See [ADR-0012: Synced Lyrics Provider Architecture](adr/0012-synced-lyrics-architecture.md) for design details.
+
+### ShareService
+
+**File**: `Sources/Kaset/Services/ShareService.swift`
+
+Provides share sheet functionality via the `Shareable` protocol:
+
+```swift
+protocol Shareable {
+    var shareTitle: String { get }
+    var shareSubtitle: String? { get }
+    var shareURL: URL? { get }
+}
+```
+
+**Conforming Types**: `Song`, `Playlist`, `Album`, `Artist`
+
+**Share Text Format**: "Title by Artist" or just "Title" for artists.
+
+### SongLikeStatusManager
+
+**File**: `Sources/Kaset/Services/SongLikeStatusManager.swift`
+
+Caches and syncs like/dislike status for songs:
+
+| Method | Description |
+|--------|-------------|
+| `status(for:)` | Get cached status for video ID or Song |
+| `isLiked(_:)` | Check if song is liked |
+| `setStatus(_:for:)` | Update cache (optimistic update) |
+| `rate(_:status:)` | Sync rating with YouTube Music API |
+
+**Optimistic Updates**: Updates cache immediately, rolls back on API failure.
+
+### URLHandler
+
+**File**: `Sources/Kaset/Services/URLHandler.swift`
+
+Parses YouTube Music URLs, regular YouTube watch links, and custom `kaset://` URLs:
+
+| URL Pattern | ParsedContent |
+|-------------|---------------|
+| `music.youtube.com/watch?v=xxx` | `.song(videoId:)` |
+| `music.youtube.com/playlist?list=xxx` | `.playlist(id:)` |
+| `music.youtube.com/browse/MPRExxx` | `.album(id:)` |
+| `music.youtube.com/channel/UCxxx` | `.artist(id:)` |
+| `youtube.com/watch?v=xxx` | `.youtubeVideo(videoId:)` |
+| `youtu.be/xxx` | `.youtubeVideo(videoId:)` |
+| `kaset://play?v=xxx` | `.song(videoId:)` |
+| `kaset://playlist?list=xxx` | `.playlist(id:)` |
+| `kaset://album?id=xxx` | `.album(id:)` |
+| `kaset://artist?id=xxx` | `.artist(id:)` |
+
+**Usage**: Custom-scheme URLs enter through `AppDelegate.application(_:open:)`. The app delegate buffers cold-launch deliveries until the SwiftUI scene subscribes, then posts `.kasetOpenURLs` for `KasetApp.handleIncomingURL` to parse and route. Music song links play through `PlayerService`; regular YouTube watch links switch to the YouTube source and open playback in the floating video window.
+
+### ScriptCommands (AppleScript)
+
+**File**: `Sources/Kaset/Services/Scripting/ScriptCommands.swift`
+
+Provides AppleScript support for external automation via NSScriptCommand subclasses:
+
+| Command Class | AppleScript Command | Description |
+|---------------|---------------------|-------------|
+| `PlayCommand` | `play` | Resume playback, or start a queue that has not played yet at its current position |
+| `PlayVideoCommand` | `play video "id"` | Play a video by ID and start a radio queue from it |
+| `PauseCommand` | `pause` | Pause playback |
+| `PlayPauseCommand` | `playpause` | Toggle play/pause |
+| `NextTrackCommand` | `next track` | Skip to next track |
+| `PreviousTrackCommand` | `previous track` | Go to previous track |
+| `SetVolumeCommand` | `set volume N` | Set volume (0-100) |
+| `ToggleMuteCommand` | `toggle mute` | Toggle mute state |
+| `ToggleShuffleCommand` | `toggle shuffle` | Toggle shuffle on/off (binary; does not reach Smart Shuffle) |
+| `CycleRepeatCommand` | `cycle repeat` | Cycle repeat (Off → All → One) |
+| `LikeTrackCommand` | `like track` | Like current track |
+| `DislikeTrackCommand` | `dislike track` | Dislike current track |
+| `GetPlayerInfoCommand` | `get player info` | Returns player state as JSON |
+| `GetPlayQueueCommand` | `get play queue` | Returns the queue and active index as JSON |
+| `PlayTrackAtIndexCommand` | `play track at index N` | Play a queue entry by 1-based index |
+| `PlayVideosCommand` | `play videos {ids} [starting at N]` | Replace the queue with video IDs and start at a 1-based index |
+| `AddToQueueCommand` | `add to queue {ids} [with next]` | Append video IDs, or insert them after the current track |
+| `RemoveFromQueueCommand` | `remove from queue "id"` | Remove every entry with a video ID, except the playing one |
+
+**Implementation Details**:
+
+- Commands access `PlayerService.shared` via `MainActor.assumeIsolated` (AppleScript runs on main thread)
+- Synchronous methods (shuffle, repeat, like/dislike, add/remove queue entries) execute directly
+- Commands that start playback begin their playback intent before returning, and `play videos` also replaces the queue before returning, so a later command (even one sent without waiting for a reply) supersedes or acts on the result of an earlier one
+- Async methods (play, pause, volume) spawn detached Tasks
+- All commands return AppleScript errors (`-1728`) if `PlayerService.shared` is nil
+- Logging via `DiagnosticsLogger.scripting`
+
+**Related Files**:
+- `Sources/Kaset/Kaset.sdef` — AppleScript dictionary definition
+- `Sources/Kaset/Info.plist` — `NSAppleScriptEnabled` and `OSAScriptingDefinition` keys
+
+**Usage**:
+```applescript
+tell application "Kaset"
+    play
+    set volume 50
+    get player info  -- Returns JSON string
+end tell
+```
+
+### App Intents (Shortcuts, Siri, Spotlight)
+
+**Directory**: `Sources/Kaset/Services/AppIntents/` · Decision record: [ADR-0033](adr/0033-app-intents.md) · User docs: [shortcuts.md](shortcuts.md)
+
+| File | Role |
+|------|------|
+| `AppIntentsBridge.swift` | `@MainActor` singleton configured in `KasetApp.init`: services, the deep-link readiness gate, the Library snapshot, and the operations intents call |
+| `PlaybackControlIntents.swift` | Play/pause, pause, resume, next/previous (via `NowPlayingManager.handleAppIntentCommand`), get current song, like/dislike |
+| `PlayContentIntents.swift` | Play music (search), song, playlist, album, Liked Music; playlist and album intents are also the entities' `OpenIntent`s |
+| `MusicEntities.swift` | `SongEntity`, `PlaylistEntity`, `AlbumEntity` (the latter two `IndexedEntity`) and their string queries |
+| `KasetShortcuts.swift` | `AppShortcutsProvider` with Siri phrases, localized from `Resources/AppShortcuts.xcstrings` |
+| `SpotlightLibraryIndexer.swift` | Replaces the Spotlight index with the signed-in Library's playlists and albums |
+
+**Implementation Details**:
+
+- `MainWindow` publishes the Library to the bridge once it has loaded (empty when signed out); the bridge reindexes Spotlight and refreshes App Shortcut parameters.
+- Playback intents set `openAppWhenRun`, wait for `AppIntentsBridge.isReady` (the same gate as `kaset://` deep links), and show the main window before playing.
+- `Scripts/build-app.sh` generates `Metadata.appintents` with `appintentsmetadataprocessor`, since SwiftPM has no App Intents build phase, and fails if `AppShortcuts.xcstrings` is out of sync with the phrases in code.
+- Intents only run in team-signed builds and from `/Applications` or `~/Applications`.
+
+### UpdaterService
+
+**File**: `Sources/Kaset/Services/UpdaterService.swift`
+
+Manages application updates via Sparkle framework:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `automaticChecksEnabled` | `Bool` | Auto-check on launch |
+| `canCheckForUpdates` | `Bool` | Whether check is allowed now |
+
+**Key Methods**:
+- `checkForUpdates()` — Manually trigger update check
+
+See [ADR-0007: Sparkle Auto-Updates](adr/0007-sparkle-auto-updates.md) for design details.
+
+### AppDelegate
+
+**File**: `Sources/Kaset/AppDelegate.swift`
+
+Application lifecycle management:
+
+- Implements `NSWindowDelegate` to hide window instead of close
+- Keeps app running when window is closed (`applicationShouldTerminateAfterLastWindowClosed` returns `false`)
+- Handles dock icon click to reopen window
+
+## Authentication Flow
+
+```
+App Launch
+    │
+    ▼
+┌─────────────────┐
+│ Check cookies   │──── __Secure-3PAPISID exists? ────┐
+│ in WebKitManager│                                    │
+└─────────────────┘                                    │
+    │ No                                               │ Yes
+    ▼                                                  ▼
+┌─────────────────┐                          ┌─────────────────┐
+│ Show LoginSheet │                          │ AuthService     │
+│ (WKWebView)     │                          │ .loggedIn       │
+└─────────────────┘                          └─────────────────┘
+    │
+    │ User signs in → cookies set
+    │
+    ▼
+┌─────────────────┐
+│ Observer fires  │
+│ cookiesDidChange│
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│ Extract SAPISID │
+│ Dismiss sheet   │
+└─────────────────┘
+```
+
+## API Request Flow
+
+The Music and YouTube API clients share the same high-level request shape but use different origins and InnerTube client identities. The Music path looks like this:
+
+```
+YTMusicClient.getHome()
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ buildAuthHeaders()                              │
+│  1. Get cookies from WebKitManager              │
+│  2. Extract __Secure-3PAPISID                   │
+│  3. Compute SAPISIDHASH = ts_SHA1(ts+sapi+origin)│
+│  4. Build Cookie, Authorization, Origin headers │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ POST https://music.youtube.com/youtubei/v1/browse│
+│ Body: { context: { client: WEB_REMIX }, ... }   │
+└─────────────────────────────────────────────────┘
+    │
+    ├── 200 OK → Parse JSON → Return HomeResponse
+    │
+    └── 401/403 → Throw YTMusicError.authExpired
+                  → AuthService.sessionExpired()
+                  → Show LoginSheet
+```
+
+`YouTubeClient` follows the same cookie/SAPISIDHASH flow with `https://www.youtube.com`, the `WEB` client context, and `yt:`-prefixed cache keys.
+
+The optional Ask path begins with the watch page's existing `next` request. A
+strict parser may return an account- and video-bound bootstrap; it never treats
+HTTP 200 alone as eligibility. Initial preparation and direct server-chip
+submission use the Ask-specific transport, whose response collection and frame
+sizes are bounded and whose redirects must remain same-origin. Panel calls are
+not cached or automatically retried. Only sanitized visible messages leave the
+Ask domain layer, while continuations and commands remain opaque in memory.
+Production calls are disabled until a request profile passes the read-only
+parity gate described in [ADR-0032](adr/0032-youtube-ask-gemini.md).
+
+## Playback Flow
+
+This diagram covers YouTube Music playback. Regular YouTube playback is documented in [youtube.md](youtube.md) and uses `YouTubePlayerService` plus `YouTubeWatchWebView`.
+
+```
+User clicks Play
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ PlayerService.play(videoId:)                    │
+│  → Sets pendingPlayVideoId                      │
+│  → Shows mini player toast                      │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ PersistentPlayerView appears                    │
+│  → Gets singleton WebView                       │
+│  → Loads music.youtube.com/watch?v={videoId}    │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ WKWebView plays audio (DRM handled by WebKit)   │
+│  → JS bridge sends STATE_UPDATE messages        │
+│  → PlayerService updates isPlaying, progress    │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ WKWebView Media Session (native)                │
+│  → Updates macOS Now Playing (with album art)   │
+│ NowPlayingManager                               │
+│  → Registers media key handlers → PlayerService │
+└─────────────────────────────────────────────────┘
+```
+
+## Background Audio Flow
+
+```
+User closes window (⌘W or red button)
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ AppDelegate.windowShouldClose(_:)               │
+│  → Returns false (prevents close)               │
+│  → Hides window instead                         │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ WebView remains alive (in singleton)            │
+│  → Audio continues playing                      │
+│  → Media keys still work                        │
+└─────────────────────────────────────────────────┘
+    │
+    │ User clicks dock icon
+    ▼
+┌─────────────────────────────────────────────────┐
+│ AppDelegate.applicationShouldHandleReopen       │
+│  → Shows hidden window                          │
+│  → Same WebView still playing                   │
+└─────────────────────────────────────────────────┘
+    │
+    │ User quits (⌘Q)
+    ▼
+┌─────────────────────────────────────────────────┐
+│ App terminates                                  │
+│  → WebView destroyed → Audio stops              │
+└─────────────────────────────────────────────────┘
+```
+
+## Error Handling
+
+### YTMusicError
+
+**File**: `Sources/Kaset/Models/YTMusicError.swift`
+
+Unified error type for the app:
+
+| Error | Description |
+|-------|-------------|
+| `.authExpired` | Session invalid (401/403) |
+| `.notAuthenticated` | No valid session |
+| `.networkError` | Connection failed |
+| `.parseError` | JSON decoding failed |
+| `.apiError` | API returned error with code |
+| `.playbackError` | Playback-related failure |
+| `.unknown` | Generic error |
+
+### Error Flow
+
+1. API returns 401/403 → `YTMusicClient` throws `.authExpired`
+2. `AuthService.sessionExpired()` called → state becomes `.loggedOut`
+3. `AuthService.needsReauth` set to `true`
+4. `MainWindow` observes and presents `LoginSheet`
+5. User re-authenticates → sheet dismissed, view reloads
+
+## Logging
+
+All services log via `DiagnosticsLogger`:
+
+```swift
+DiagnosticsLogger.player.info("Loading video: \(videoId)")
+DiagnosticsLogger.auth.error("Cookie extraction failed")
+```
+
+**Categories**: `.player`, `.auth`, `.api`, `.webKit`, `.haptic`, `.notification`, `.scripting`
+
+**Levels**: `.debug`, `.info`, `.warning`, `.error`
+
+## Utilities
+
+The `Sources/Kaset/Utilities/` folder contains shared helper components.
+
+### ImageCache
+
+**File**: `Sources/Kaset/Utilities/ImageCache.swift`
+
+Thread-safe actor with memory and disk caching:
+
+| Feature | Description |
+|---------|-------------|
+| Memory cache | 200 items, 50MB limit via `NSCache` |
+| Disk cache | 200MB limit with LRU eviction |
+| Downsampling | Images resized to display size before caching |
+| Prefetch | Structured cancellation for SwiftUI `.task` lifecycle |
+
+**Key Methods**:
+- `image(for:targetSize:)` — Fetch and cache image
+- `prefetch(urls:targetSize:maxConcurrent:)` — Batch prefetch for lists
+
+### ColorExtractor
+
+**File**: `Sources/Kaset/Utilities/ColorExtractor.swift`
+
+Extracts dominant colors from album art for dynamic theming:
+
+- Uses `CIAreaAverage` filter for color extraction
+- Caches extracted colors to avoid repeated processing
+- Used by `AccentBackground` for gradient overlays
+
+### AnimationConfiguration
+
+**File**: `Sources/Kaset/Utilities/AnimationConfiguration.swift`
+
+Standardized animation timing for consistent motion design:
+
+| Animation | Duration | Curve | Used For |
+|-----------|----------|-------|----------|
+| `.standard` | 0.25s | `.easeInOut` | General transitions |
+| `.quick` | 0.15s | `.easeOut` | Button feedback |
+| `.slow` | 0.4s | `.easeInOut` | Panel reveals |
+
+### AccessibilityIdentifiers
+
+**File**: `Sources/Kaset/Utilities/AccessibilityIdentifiers.swift`
+
+Centralized UI test identifiers organized by feature:
+
+```swift
+enum AccessibilityID {
+    enum Player { static let playButton = "player.playButton" }
+    enum Queue { static let container = "queue.container" }
+    // ...
+}
+```
+
+**Benefits**: Prevents string duplication, enables IDE autocomplete in tests.
+
+### IntelligenceModifier
+
+**File**: `Sources/Kaset/Utilities/IntelligenceModifier.swift`
+
+SwiftUI modifier to hide AI features when unavailable:
+
+```swift
+.requiresIntelligence()  // Hides view if Apple Intelligence unavailable
+```
+
+Checks `FoundationModelsService.shared.isAvailable` and applies opacity/disabled state.
+
+### RetryPolicy
+
+**File**: `Sources/Kaset/Utilities/RetryPolicy.swift`
+
+Exponential backoff for network retries:
+
+```swift
+try await RetryPolicy.execute(
+    maxAttempts: 3,
+    initialDelay: .seconds(1),
+    shouldRetry: { ($0 as? YTMusicError)?.isRetryable ?? false }
+) {
+    try await client.fetchData()
+}
+```
+
+## Performance Guidelines
+
+This section documents performance patterns and optimizations used throughout the codebase.
+
+### Network Optimization
+
+**File**: `Sources/Kaset/Services/API/YTMusicClient.swift`
+
+The API client uses an optimized `URLSession` configuration:
+
+```swift
+let configuration = URLSessionConfiguration.default
+configuration.httpMaximumConnectionsPerHost = 6   // Connection pool size (HTTP/2 multiplexing is automatic)
+configuration.urlCache = URLCache.shared          // HTTP caching
+configuration.timeoutIntervalForRequest = 15      // Fail fast
+```
+
+### API Caching
+
+**File**: `Sources/Kaset/Services/API/APICache.swift`
+
+In-memory cache with TTL and LRU eviction:
+
+| TTL | Endpoints |
+|-----|-----------|
+| 5 minutes | Home, Explore, Library |
+| 2 minutes | Search |
+| 30 minutes | Playlist, Song metadata |
+| 1 hour | Artist |
+| 24 hours | Lyrics |
+
+**Design**:
+- Pre-allocated dictionary capacity to reduce rehashing
+- Periodic eviction (every 30 seconds) instead of per-write
+- Stable cache keys using SHA256 hash of sorted JSON body
+- Mutation invalidation clears browse, next, like, and `playlist/get_add_to_playlist` entries so library and add-to-playlist menus refresh after playlist/song changes
+- Mutation invalidation is scoped to the app's `APICache`; it does not flush `URLCache.shared` HTTP responses
+
+### Image Caching
+
+**File**: `Sources/Kaset/Utilities/ImageCache.swift`
+
+Thread-safe actor with memory and disk caching:
+
+| Feature | Description |
+|---------|-------------|
+| Memory cache | 200 items, 50MB limit via `NSCache` |
+| Disk cache | 200MB limit with LRU eviction |
+| Downsampling | Images resized to display size before caching |
+| Structured cancellation | Prefetch respects SwiftUI `.task` cancellation |
+
+**Prefetch Pattern**:
+```swift
+// In view's .task modifier - cancellation is automatic when view disappears
+await ImageCache.shared.prefetch(
+    urls: section.items.prefix(10).compactMap { $0.thumbnailURL },
+    targetSize: CGSize(width: 160, height: 160),
+    maxConcurrent: 4
+)
+```
+
+### SwiftUI View Optimization
+
+#### Stable ForEach Identity
+
+**Avoid** creating new array identity on every render:
+
+```swift
+// ❌ Bad: Array(enumerated()) creates new array identity
+ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+    Row(item)
+}
+
+// ✅ Good: Direct iteration with stable id
+ForEach(items) { item in
+    Row(item)
+}
+
+// ✅ Good: Enumeration only when rank is needed (charts)
+ForEach(Array(chartItems.enumerated()), id: \.element.id) { index, item in
+    ChartRow(item, rank: index + 1)
+}
+```
+
+#### Isolating Playback Progress Updates
+
+Playback progress changes on every bridge tick. Observation invalidates exactly the views that read a property, and `.onChange(of:)` counts as a read, so keep progress reads in small leaf views instead of in a player bar or window body:
+
+```swift
+// In PlayerBar: owns the seek state but never reads progress or the
+// controller's properties in body, so ticks skip song info, artwork, and buttons.
+@State private var seekController = PlayerBarSeekController()
+
+PlayerBarTimelineLane(seekController: seekController, segments: segments, accent: accent)
+
+// In PlayerBarTimelineLane: the only player bar view that reads progress
+.onChange(of: playerService.progress) { _, newValue in
+    seekController.progressDidChange(newValue, duration: playerService.duration)
+}
+```
+
+- `PlayerBarTimelineLane`, `MiniPlayerSeekSection`, and `YouTubePlayerBarTimelineLane` are the only player views that read progress. Don't add progress reads to `PlayerBar`, `MiniPlayerWindow`, or `YouTubePlayerBar`.
+- Compute values that don't depend on progress, such as mix segments, in the parent and pass them in.
+- Cache formatted time strings and rebuild them only when the displayed second changes (`PlayerBarSeekController.progressDidChange`).
+- On an `@Observable` class, calling a mutating method on a stored struct notifies observers even when nothing changes. On per-tick paths, mutate a copy and assign it back only if it differs (see `PlayerBarSeekController.reconcileHold`).
+
+#### Task Cancellation
+
+Cancel async work when views disappear or inputs change:
+
+```swift
+// In CachedAsyncImage
+@State private var loadTask: Task<Void, Never>?
+
+.task(id: url) {
+    loadTask?.cancel()
+    loadTask = Task {
+        guard !Task.isCancelled else { return }
+        image = await ImageCache.shared.image(for: url)
+    }
+}
+.onDisappear {
+    loadTask?.cancel()
+}
+```
+
+For Ask Gemini, cancellation is also an identity boundary. The child view model
+owns preparation, submission, and New Chat tasks; canceling the watch route
+increments its operation generation and discards every opaque command. A late
+response must validate the captured video, authentication generation,
+primary-account scope, conversation ID, and revision before publishing.
+
+### Memory Management
+
+- **NSCache** for images responds to memory pressure automatically
+- `DispatchSource.makeMemoryPressureSource` clears image cache on system warning
+- Prefetch tasks are cancellable to prevent memory buildup during fast scrolling
+
+### Profiling Checklist
+
+Before completing non-trivial features, verify:
+
+- [ ] No `await` calls inside loops or `ForEach`
+- [ ] Lists use `LazyVStack`/`LazyHStack` for large datasets
+- [ ] Network calls cancelled on view disappear (`.task` handles this)
+- [ ] Parsers have `measure {}` tests if processing large payloads
+- [ ] Images use `ImageCache` with appropriate `targetSize`
+- [ ] Search input is debounced (not firing on every keystroke)
+- [ ] ForEach uses stable identity (avoid `Array(enumerated())` unless needed)
+
+## UI Design (macOS 26+ with macOS 15 fallbacks)
+
+The app uses Apple's **Liquid Glass** design language introduced in macOS 26 when available. Compatibility helpers in `LiquidGlassCompat.swift` keep the core app usable on macOS 15 by falling back to material backgrounds and non-AI views.
+
+### Glass Effect Patterns
+
+| Component | Glass Pattern |
+|-----------|---------------|
+| `PlayerBar` | `.glassEffect(.regular.interactive(), in: .capsule)` |
+| `Sidebar` | `List(.sidebar)` with `.scrollContentBackground(.hidden)` (macOS 26) so the system Liquid Glass shows through; detail content slides under it (ADR-0021) |
+| `QueueView` / `LyricsView` | `.glassEffectTransition(.materialize)` |
+| Search field | `.glassEffect(.regular, in: .capsule)` |
+| Search suggestions | `.glassEffect(.regular, in: .rect(cornerRadius: 8))` |
+
+### Glass Effect Best Practices
+
+1. **Use `GlassEffectContainer`** to wrap multiple glass elements
+2. **Use `.glassEffectTransition(.materialize)`** for panels that appear/disappear
+3. **Use `@Namespace` + `.glassEffectID()`** for morphing between states
+4. **Avoid glass-on-glass** — don't apply `.buttonStyle(.glass)` to buttons already inside a glass container
+5. **Reserve glass for navigation/floating controls** — don't apply a glass *material* to content. Content may, however, pass *beneath* the system-provided navigation glass: on macOS 26 detail content slides under the floating `NavigationSplitView` sidebar and refracts through it (see ADR-0021)
+
+## Foundation Models (Apple Intelligence)
+
+Kaset integrates Apple's on-device Foundation Models framework for AI-powered features. See [ADR-0005: Foundation Models Architecture](adr/0005-foundation-models-architecture.md) for detailed design decisions.
+
+### Architecture Overview
+
+```
+User Input (natural language)
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ FoundationModelsService                         │
+│  → Check availability                           │
+│  → Create session with tools                    │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ LanguageModelSession                            │
+│  → Parse input to @Generable type               │
+│  → Call tools for grounded data                 │
+│  → Return structured response                   │
+└─────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────┐
+│ Execute Action                                  │
+│  → MusicIntent → PlayerService                  │
+│  → QueueIntent → PlayerService queue methods    │
+│  → LyricsSummary → Display in UI                │
+└─────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `FoundationModelsService` | `Sources/Kaset/Services/AI/` | Singleton managing AI availability and sessions |
+| `@Generable` Models | `Sources/Kaset/Models/AI/` | Type-safe structured outputs (`MusicIntent`, `LyricsSummary`, etc.) |
+| Tools | `Sources/Kaset/Services/AI/Tools/` | Ground AI responses in real catalog data |
+| `AIErrorHandler` | `Sources/Kaset/Services/AI/` | User-friendly error messages |
+| `RequiresIntelligenceModifier` | `Sources/Kaset/Utilities/` | Hide AI features when unavailable |
+
+### AI Tools
+
+Tools ground AI responses in real data from the YouTube Music catalog, preventing hallucination.
+
+**MusicSearchTool** (`Sources/Kaset/Services/AI/Tools/MusicSearchTool.swift`)
+
+Searches the YouTube Music catalog for songs, artists, and albums:
+
+```swift
+@Generable
+struct MusicSearchResult {
+    let songs: [SongResult]
+    let artists: [ArtistResult]
+    let albums: [AlbumResult]
+}
+```
+
+**QueueTool** (`Sources/Kaset/Services/AI/Tools/QueueTool.swift`)
+
+Provides access to the current playback queue for AI-driven queue management:
+
+- Returns current queue contents
+- Used by `QueueIntent` for natural language queue manipulation
+- Enables commands like "remove duplicates" or "play upbeat songs next"
+
+### @Generable Models
+
+Type-safe structured outputs for AI responses:
+
+| Model | File | Purpose |
+|-------|------|---------|
+| `MusicIntent` | `Sources/Kaset/Models/AI/MusicIntent.swift` | Parsed user commands (play, pause, search, etc.) |
+| `LyricsSummary` | `Sources/Kaset/Models/AI/LyricsSummary.swift` | Lyrics explanation with themes and mood |
+| `PlaylistChanges` | `Sources/Kaset/Models/AI/PlaylistChanges.swift` | Queue refinement operations |
+
+### AI Features
+
+| Feature | Trigger | Model Used |
+|---------|---------|------------|
+| Command Bar | ⌘K | `MusicIntent`, `MusicQuery` |
+| Lyrics Explanation | "Explain" button in lyrics view | `LyricsSummary` |
+| Queue Management | Natural language in command bar | `QueueIntent` |
+| Queue Refinement | Refine button in queue view | `QueueChanges` |
+
+### Best Practices
+
+1. **Token Limit**: 4,096 tokens per session. Chunk large playlists, truncate long lyrics.
+2. **Streaming**: Use `streamResponse` for long-form content (lyrics explanation).
+3. **Tools**: Always use tools to ground responses in real data—prevents hallucination.
+4. **Graceful Degradation**: Use `.requiresIntelligence()` modifier to hide unavailable features.
+5. **Error Handling**: Use `AIErrorHandler` for user-friendly messages.
+
+## UI Components
+
+This section documents key SwiftUI views and their integration patterns.
+
+### QueueView
+
+**File**: `Sources/Kaset/Views/QueueView.swift`
+
+Right sidebar panel displaying the playback queue:
+
+- Shows "Up Next" header with shuffle/clear actions
+- Displays queue items with drag-to-reorder support
+- AI-powered "Refine" button for natural language queue editing
+- Uses `.glassEffect(.regular.interactive())` with `.glassEffectTransition(.materialize)`
+
+**Integration**: Toggled via `PlayerService.showQueue`, placed outside `NavigationSplitView` in `MainWindow`.
+
+### LyricsView
+
+**File**: `Sources/Kaset/Views/LyricsView.swift`
+
+Right sidebar panel displaying song lyrics:
+
+- Reads `SyncedLyricsService` from the environment for the current `LyricResult`
+- When `SettingsManager.syncedLyricsEnabled` is enabled, builds `LyricsSearchInfo` from the active track and requests synced lyrics first
+- Falls back to `YTMusicClient.getLyrics(videoId:)` for plain YouTube Music lyrics when synced providers return `.unavailable`
+- Starts 10 Hz WebView playback polling only while rendering `.synced` lyrics so line highlighting stays aligned without constant idle polling
+- `SyncedLyricsDisplayView` auto-centers the current line and supports tap-to-seek
+- "Explain" button triggers AI-powered `LyricsSummary` generation for either synced or plain lyrics
+- Width: 280px, animated show/hide
+
+**Integration**: Toggled via `PlayerService.showLyrics`, persists across all navigation states, and consumes playback time from `PlayerService.currentTimeMs`.
+
+### CommandBarView
+
+**File**: `Sources/Kaset/Views/CommandBarView.swift`
+
+Spotlight-style command palette triggered by ⌘K:
+
+- Natural language input parsed via `MusicIntent`
+- Shows suggestions and action previews
+- Supports commands: play, pause, skip, search, queue management
+- Floating overlay with glass effect
+
+**Trigger**: `@Environment(\.showCommandBar)` environment key.
+
+### ToastView
+
+**File**: `Sources/Kaset/Views/ToastView.swift`
+
+Temporary notification overlay for user feedback:
+
+| Toast Type | Duration | Purpose |
+|------------|----------|---------|
+| Success | 2s | Action completed (e.g., "Added to library") |
+| Error | 3s | Action failed with message |
+| Info | 2s | Informational feedback |
+
+**Usage**: Managed via environment or direct state binding.
+
+### SharedViews
+
+**Directory**: `Sources/Kaset/Views/SharedViews/`
+
+Reusable components used across the app:
+
+| Component | Purpose |
+|-----------|---------|
+| `ErrorView` | Standardized error display with retry button |
+| `LoadingView` | Skeleton loading states |
+| `SkeletonView` | Shimmer placeholder for loading content |
+| `EqualizerView` | Animated bars for "now playing" indicator |
+| `HomeSectionItemCard` | Card component for carousel items |
+| `InteractiveCardStyle` | Hover/press effects for cards |
+| `NavigationDestinationsModifier` | Centralized navigation destination handling |
+| `ShareContextMenu` | Context menu for sharing content |
+| `StartRadioContextMenu` | Context menu for starting radio/mix |
+| `FavoritesSection` | Horizontal scrolling favorites row |
+| `FavoritesContextMenu` | Context menu for favorites management |
+| `SongActionsHelper` | Common song action handlers |
+| `AnimationModifiers` | Reusable animation view modifiers |
+
+### PlayerBar
+
+**File**: `Sources/Kaset/Views/PlayerBar.swift`
+
+A floating capsule-shaped player bar at the bottom of the content area:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ◀◀  ▶  ▶▶  │  🎵 [Thumbnail] Song Title - Artist  │  🔊━━━ │
+└─────────────────────────────────────────────────────────────┘
+         ↑                      ↑                        ↑
+    Playback              Now Playing              Volume
+    Controls               Info                   Control
+```
+
+**Implementation**:
+```swift
+GlassEffectContainer(spacing: 0) {
+    HStack {
+        playbackControls
+        Spacer()
+        centerSection  // thumbnail + track info
+        Spacer()
+        volumeControl
+    }
+    .glassEffect(.regular.interactive(), in: .capsule)
+}
+```
+
+**Key Points**:
+- Uses `GlassEffectContainer` to wrap glass elements
+- `.glassEffect(.regular.interactive(), in: .capsule)` for the liquid glass look
+- Only shows functional buttons (no placeholder buttons)
+- Thumbnail and track info in center section
+
+### PlayerBar Integration
+
+The `PlayerBar` must be added to **every navigable view** via `safeAreaInset`:
+
+```swift
+// In HomeView, LibraryView, SearchView, PlaylistDetailView
+.safeAreaInset(edge: .bottom, spacing: 0) {
+    PlayerBar()
+}
+```
+
+**Why not in MainWindow?**
+- `NavigationSplitView` detail views have their own navigation stacks
+- Views pushed onto a `NavigationStack` don't inherit parent's `safeAreaInset`
+- Each view must explicitly include the `PlayerBar`
+
+### Sidebar
+
+**File**: `Sources/Kaset/Views/Sidebar.swift`
+
+Clean, minimal sidebar with only functional navigation:
+
+```
+┌──────────────────┐
+│ 🔍 Search        │  ← Main navigation
+│ 🏠 Home          │
+├──────────────────┤
+│ Library          │  ← Section header
+│ 🎵 Playlists     │  ← Functional items only
+└──────────────────┘
+```
+
+**Design Principles**:
+- Only show items that have implemented functionality
+- Remove placeholder items (Artists, Albums, Songs, Liked Songs, etc.)
+- Use standard SwiftUI `List` with `.listStyle(.sidebar)` as the column root
+- Apply `compatTranslucentSidebar()`: on macOS 26 it hides the list's opaque
+  background so the floating Liquid Glass shows through and detail content
+  slides under it; on legacy macOS 15 it falls back to an `.ultraThinMaterial`
+  frosted panel (ADR-0021)
+
+### Persistent UI Elements
+
+UI elements that must remain visible across all navigation states (like the lyrics sidebar) should be placed **outside** the `NavigationSplitView` hierarchy in `MainWindow`:
+
+```swift
+// MainWindow.swift
+var mainContent: some View {
+    HStack(spacing: 0) {
+        NavigationSplitView { ... }  // Sidebar + detail navigation
+
+        // Lyrics sidebar OUTSIDE navigation - persists across all pushed views
+        LyricsView(...)
+            .frame(width: playerService.showLyrics ? 280 : 0)
+    }
+}
+```
+
+**Why?**
+- Views pushed onto a `NavigationStack` replace content *inside* the stack
+- If a sidebar is inside the stack, pushed views won't see it
+- Placing persistent elements outside the navigation hierarchy ensures they remain visible regardless of navigation state
+
+**Pattern**: Global overlays/sidebars → `MainWindow` level, outside `NavigationSplitView`
+
+### @available Attributes
+
+Foundation Models-backed AI components remain macOS 26.0+ only:
+
+```swift
+@available(macOS 26.0, *)
+struct CommandBarView: View { ... }
+
+@available(macOS 26.0, *)
+struct LyricsView: View { ... }
+```
+
+Core navigation and playback surfaces should avoid macOS 26-only annotations and use compatibility wrappers or explicit fallback views instead.

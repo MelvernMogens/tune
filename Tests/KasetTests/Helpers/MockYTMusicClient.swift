@@ -1,0 +1,1505 @@
+// swiftlint:disable file_length
+import Foundation
+@testable import Kaset
+
+/// A mock implementation of YTMusicClientProtocol for testing.
+@MainActor
+final class MockYTMusicClient: YTMusicClientProtocol { // swiftlint:disable:this type_body_length
+    enum SearchEndpoint: Hashable {
+        case mixed
+        case songs
+        case songsWithPagination
+        case videos
+        case albums
+        case artists
+        case profiles
+        case playlists
+        case featuredPlaylists
+        case communityPlaylists
+        case podcasts
+        case episodes
+    }
+
+    private static func playlistContinuationToken(playlistId: String, index: Int) -> String {
+        "mock-playlist-continuation|\(playlistId)|\(index)"
+    }
+
+    private static func parsePlaylistContinuationToken(_ token: String) -> (playlistId: String, index: Int)? {
+        let components = token.split(separator: "|", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              components[0] == "mock-playlist-continuation",
+              let index = Int(components[2])
+        else { return nil }
+        return (String(components[1]), index)
+    }
+
+    // MARK: - Response Stubs
+
+    var homeResponse: HomeResponse = .init(sections: [])
+    var homeContinuationSections: [[HomeSection]] = []
+    var personalizedRecommendationsResponse: HomeResponse = .init(sections: [])
+    var personalizedRecommendationsContinuationSections: [[HomeSection]] = []
+    var exploreResponse: HomeResponse = .init(sections: [])
+    var exploreContinuationSections: [[HomeSection]] = []
+    var chartsResponse: HomeResponse = .init(sections: [])
+    var chartsContinuationSections: [[HomeSection]] = []
+    var moodsAndGenresResponse: HomeResponse = .init(sections: [])
+    var moodsAndGenresContinuationSections: [[HomeSection]] = []
+    var newReleasesResponse: HomeResponse = .init(sections: [])
+    var newReleasesContinuationSections: [[HomeSection]] = []
+    var historyResponse: HomeResponse = .init(sections: [])
+    var historyResponseSequence: [HomeResponse] = []
+    var historyContinuationSections: [[HomeSection]] = []
+    var podcastsSections: [PodcastSection] = []
+    var podcastsContinuationSections: [[PodcastSection]] = []
+    var searchResponse: SearchResponse = .empty
+    var mixedSearchResponse: SearchResponse?
+    var songsSearchResponse: SearchResponse?
+    var videosSearchResponse: SearchResponse?
+    var albumsSearchResponse: SearchResponse?
+    var artistsSearchResponse: SearchResponse?
+    var profilesSearchResponse: SearchResponse?
+    var playlistsSearchResponse: SearchResponse?
+    var featuredPlaylistsSearchResponse: SearchResponse?
+    var communityPlaylistsSearchResponse: SearchResponse?
+    var podcastsSearchResponse: SearchResponse?
+    var episodesSearchResponse: SearchResponse?
+    var searchContinuationResponses: [String: SearchResponse] = [:]
+    var searchSuggestions: [SearchSuggestion] = []
+    var libraryPlaylists: [Playlist] = []
+    var libraryAlbums: [Album] = []
+    var libraryArtists: [Artist] = []
+    var libraryPodcastShows: [PodcastShow] = []
+    var uploadedSongsPlaylist: Playlist?
+    var libraryContentResponses: [PlaylistParser.LibraryContent] = []
+    var libraryContentResponseDelays: [Duration] = []
+    var shouldWaitForLibraryContentResponse = false
+    var addToPlaylistMenus: [String: AddToPlaylistMenu] = [:]
+    var defaultAddToPlaylistMenu = AddToPlaylistMenu(title: nil, options: [], canCreatePlaylist: false)
+    var onGetLibraryContent: (@MainActor () -> Void)?
+    var onGetPodcasts: (@MainActor () -> Void)?
+    var beforeGetHomeReturn: (@MainActor () async -> Void)?
+    var beforeGetHomeContinuationReturn: (@MainActor () async -> Void)?
+    var beforeCreatePlaylistReturn: (@MainActor () async -> Void)?
+    var beforeSubscribeToPlaylistReturn: (@MainActor (String) async -> Void)?
+    var beforeUnsubscribeFromPlaylistReturn: (@MainActor (String) async -> Void)?
+    var beforeDeletePlaylistReturn: (@MainActor (String) async -> Void)?
+    var beforeSubscribeToPodcastReturn: (@MainActor (String) async -> Void)?
+    var beforeUnsubscribeFromPodcastReturn: (@MainActor (String) async -> Void)?
+    var subscribeToPodcastDelay: Duration?
+    var unsubscribeFromPodcastDelay: Duration?
+    var subscribeToArtistDelay: Duration?
+    var unsubscribeFromArtistDelay: Duration?
+    var rateSongDelay: Duration?
+    var rateSongErrors: [(any Error)?] = []
+    var editSongLibraryStatusResponseDelays: [Duration] = []
+    var editSongLibraryStatusErrors: [(any Error)?] = []
+    var getSongDelay: Duration?
+    var getSongErrors: [Error] = []
+    var getHistoryDelay: Duration?
+    var shouldWaitForGetHistoryResponse = false
+    var getPodcastsDelay: Duration?
+    var getPlaylistDelay: Duration?
+    var getPlaylistGate: AsyncGate?
+    var getPlaylistError: Error?
+    var playlistContinuationDelay: Duration?
+    var shouldWaitForRemoveSongFromPlaylistResponse = false
+    var removeSongFromPlaylistError: Error?
+    var mixQueueDelay: Duration?
+    var mixQueueGate: AsyncGate?
+    var mixQueueContinuationGate: AsyncGate?
+    var getRadioQueueDelay: Duration?
+    var getRadioQueueGate: AsyncGate?
+    var mixQueueResult = RadioQueueResult(songs: [], continuationToken: nil)
+    var mixQueueContinuationResult = RadioQueueResult(songs: [], continuationToken: nil)
+    var mixQueueContinuationResults: [RadioQueueResult] = []
+    private(set) var getMixQueueCallCount = 0
+    private(set) var getMixQueueContinuationCallCount = 0
+    var shouldAutoUpdatePlaylistLibraryOnMutation = true
+    var shouldAutoUpdatePodcastLibraryOnMutation = true
+    var shouldAutoUpdateArtistLibraryOnMutation = true
+    var likedSongs: [Song] = []
+    var likedSongsContinuationSongs: [[Song]] = []
+    var playlistDetails: [String: PlaylistDetail] = [:]
+    var playlistAllTracks: [String: [Song]] = [:]
+    var playlistContinuationTracks: [String: [[Song]]] = [:]
+    var forcedPlaylistContinuationResponses: [PlaylistContinuationResponse] = []
+    var artistDetails: [String: ArtistDetail] = [:]
+    var artistSongs: [String: [Song]] = [:]
+    var artistSongsResponse: [Song] = []
+    var moodCategoryResponse: HomeResponse = .init(sections: [])
+    var moodCategoryResponses: [String: HomeResponse] = [:]
+    var moodCategoryError: Error?
+    var lyricsResponses: [String: Lyrics] = [:]
+    var radioQueueSongs: [String: [Song]] = [:]
+    var songResponses: [String: Song] = [:]
+    var accountsListResponse: AccountsListResponse = .init(googleEmail: "test@gmail.com", accounts: [])
+    var accountsListStartedGate: AsyncGate?
+    var accountsListReleaseGate: AsyncGate?
+
+    // MARK: - Call Tracking
+
+    private(set) var getSongCalled = false
+    private(set) var getSongVideoIds: [String] = []
+    private(set) var getPlaylistContinuationReturnCount = 0
+    private(set) var fetchAccountsListCallCount = 0
+
+    // MARK: - Continuation State
+
+    private var _homeContinuationIndex = 0
+    private var _personalizedRecommendationsContinuationIndex = 0
+    private var _exploreContinuationIndex = 0
+    private var _chartsContinuationIndex = 0
+    private var _moodsAndGenresContinuationIndex = 0
+    private var _newReleasesContinuationIndex = 0
+    private var _historyContinuationIndex = 0
+    private var _podcastsContinuationIndex = 0
+    private var _likedSongsContinuationIndex = 0
+
+    var hasMoreHomeSections: Bool {
+        self._homeContinuationIndex < self.homeContinuationSections.count
+    }
+
+    var hasMorePersonalizedRecommendationSections: Bool {
+        self._personalizedRecommendationsContinuationIndex < self.personalizedRecommendationsContinuationSections.count
+    }
+
+    var hasMoreExploreSections: Bool {
+        self._exploreContinuationIndex < self.exploreContinuationSections.count
+    }
+
+    var hasMoreChartsSections: Bool {
+        self._chartsContinuationIndex < self.chartsContinuationSections.count
+    }
+
+    var hasMoreMoodsAndGenresSections: Bool {
+        self._moodsAndGenresContinuationIndex < self.moodsAndGenresContinuationSections.count
+    }
+
+    var hasMoreNewReleasesSections: Bool {
+        self._newReleasesContinuationIndex < self.newReleasesContinuationSections.count
+    }
+
+    var hasMoreHistorySections: Bool {
+        self._historyContinuationIndex < self.historyContinuationSections.count
+    }
+
+    var hasMorePodcastsSections: Bool {
+        self._podcastsContinuationIndex < self.podcastsContinuationSections.count
+    }
+
+    var hasMoreLikedSongs: Bool {
+        self._likedSongsContinuationIndex < self.likedSongsContinuationSongs.count
+    }
+
+    // MARK: - Call Tracking
+
+    private(set) var getHomeCalled = false
+    private(set) var getHomeCallCount = 0
+    private(set) var getHomeForceRefreshes: [Bool] = []
+    private(set) var getHomeContinuationCalled = false
+    private(set) var getHomeContinuationCallCount = 0
+    private(set) var getPersonalizedRecommendationsCalled = false
+    private(set) var getPersonalizedRecommendationsCallCount = 0
+    private(set) var getPersonalizedRecommendationsContinuationCalled = false
+    private(set) var getPersonalizedRecommendationsContinuationCallCount = 0
+    private(set) var getPodcastsContinuationCallCount = 0
+    private(set) var getExploreCalled = false
+    private(set) var getExploreCallCount = 0
+    private(set) var getHistoryCallCount = 0
+    private(set) var getHistoryContinuationCallCount = 0
+    private(set) var getExploreContinuationCalled = false
+    private(set) var getExploreContinuationCallCount = 0
+    private(set) var getChartsCalled = false
+    private(set) var getChartsCallCount = 0
+    private(set) var getChartsContinuationCallCount = 0
+    private(set) var getMoodsAndGenresContinuationCallCount = 0
+    private(set) var getNewReleasesContinuationCallCount = 0
+    private(set) var searchCalled = false
+    private(set) var searchQueries: [String] = []
+    private(set) var completedSearchEndpoints: [SearchEndpoint] = []
+    private(set) var getSearchContinuationTokens: [String] = []
+
+    var beforeSearchReturn: (@Sendable (String, SearchEndpoint) async -> Void)?
+    var beforeSearchContinuationReturn: (@Sendable (String) async -> Void)?
+    var beforeGetSongReturn: (@Sendable (String) async -> Void)?
+    var beforeGetPlaylistReturn: (@Sendable (String) async -> Void)?
+    var beforePlaylistContinuationReturn: (@Sendable (String) async -> Void)?
+    var beforeMixQueueReturn: (@Sendable (String, String?) async -> Void)?
+    var beforeMixQueueContinuationReturn: (@Sendable (String) async -> Void)?
+    var beforeRadioQueueReturn: (@Sendable (String) async -> Void)?
+    var beforeRateSongReturn: (@Sendable (String, LikeStatus) async -> Void)?
+    var beforeEditSongLibraryStatusReturn: (@Sendable ([String]) async -> Void)?
+
+    private func waitBeforeSearchReturn(query: String, endpoint: SearchEndpoint) async {
+        if let beforeSearchReturn {
+            await beforeSearchReturn(query, endpoint)
+        }
+    }
+
+    private func waitBeforeMixQueueReturn(playlistId: String, startVideoId: String?) async {
+        if let beforeMixQueueReturn {
+            await beforeMixQueueReturn(playlistId, startVideoId)
+        }
+    }
+
+    private func waitBeforeMixQueueContinuationReturn(_ continuation: String) async {
+        if let beforeMixQueueContinuationReturn {
+            await beforeMixQueueContinuationReturn(continuation)
+        }
+    }
+
+    private func waitBeforeRadioQueueReturn(videoId: String) async {
+        if let beforeRadioQueueReturn {
+            await beforeRadioQueueReturn(videoId)
+        }
+    }
+
+    private(set) var getSearchSuggestionsCalled = false
+    private(set) var getSearchSuggestionsQueries: [String] = []
+    private(set) var getLibraryContentCalled = false
+    private(set) var getLibraryContentCallCount = 0
+    private var libraryContentResponseContinuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var getLibraryPlaylistsCalled = false
+    private(set) var getLikedSongsCalled = false
+    private(set) var getLikedSongsContinuationCalled = false
+    private(set) var getLikedSongsContinuationCallCount = 0
+    private(set) var getPlaylistCalled = false
+    private(set) var getPlaylistIds: [String] = []
+    private(set) var getPlaylistContinuationCalled = false
+    private(set) var getPlaylistContinuationCallCount = 0
+    private(set) var getPlaylistContinuationTokens: [String] = []
+    private(set) var getPlaylistContinuationRequiresAuthFlags: [Bool] = []
+    private(set) var getArtistCalled = false
+    private(set) var getArtistIds: [String] = []
+    private(set) var getArtistSongsCalled = false
+    private(set) var getArtistSongsBrowseIds: [String] = []
+    private(set) var rateSongCalled = false
+    private(set) var rateSongVideoIds: [String] = []
+    private(set) var rateSongRatings: [LikeStatus] = []
+    private(set) var appliedRateSongRatings: [LikeStatus] = []
+    private(set) var resetSessionStateForAccountSwitchCalled = false
+    private(set) var resetSessionStateForAccountSwitchCallCount = 0
+    private(set) var editSongLibraryStatusCalled = false
+    private(set) var editSongLibraryStatusTokens: [[String]] = []
+    private(set) var appliedEditSongLibraryStatusTokens: [[String]] = []
+    private(set) var subscribeToPlaylistCalled = false
+    private(set) var subscribeToPlaylistIds: [String] = []
+    private(set) var deletePlaylistCalled = false
+    private(set) var deletePlaylistIds: [String] = []
+    private(set) var getAddToPlaylistOptionsVideoIds: [String] = []
+    struct CreatePlaylistCall: Equatable {
+        let title: String
+        let description: String?
+        let privacyStatus: PlaylistPrivacyStatus
+        let videoIds: [String]
+    }
+
+    struct AddSongToPlaylistCall: Equatable {
+        let videoId: String
+        let playlistId: String
+        let allowDuplicate: Bool
+    }
+
+    struct RemoveSongFromPlaylistCall: Equatable {
+        let videoId: String
+        let setVideoId: String
+        let playlistId: String
+    }
+
+    private(set) var createPlaylistCalls: [CreatePlaylistCall] = []
+    private(set) var addSongToPlaylistCalls: [AddSongToPlaylistCall] = []
+    private(set) var removeSongFromPlaylistCalls: [RemoveSongFromPlaylistCall] = []
+    private var removeSongFromPlaylistResponseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var getHistoryResponseContinuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var unsubscribeFromPlaylistCalled = false
+    private(set) var unsubscribeFromPlaylistIds: [String] = []
+    private(set) var subscribeToArtistCalled = false
+    private(set) var subscribeToArtistIds: [String] = []
+    private(set) var unsubscribeFromArtistCalled = false
+    private(set) var unsubscribeFromArtistIds: [String] = []
+    private(set) var getLyricsCalled = false
+    private(set) var getLyricsVideoIds: [String] = []
+    private(set) var getRadioQueueCalled = false
+    private(set) var getRadioQueueVideoIds: [String] = []
+    private(set) var moodCategoryCalled = false
+    private(set) var moodCategoryBrowseIds: [String] = []
+    private(set) var moodCategoryParams: [String?] = []
+
+    // MARK: - Error Simulation
+
+    var shouldThrowError: Error?
+
+    /// Per-call getSong errors, keyed by the one-based call ordinal.
+    var getSongErrorsByCallCount: [Int: Error] = [:]
+
+    /// Per-seed radio errors: `getRadioQueue(videoId:)` throws the mapped error for that seed only,
+    /// so tests can simulate a transient failure on one seed while others succeed.
+    var radioQueueErrors: [String: Error] = [:]
+
+    // MARK: - Protocol Implementation
+
+    func getHome(forceRefresh: Bool) async throws -> HomeResponse {
+        self.getHomeCalled = true
+        self.getHomeCallCount += 1
+        self.getHomeForceRefreshes.append(forceRefresh)
+        self._homeContinuationIndex = 0
+        let response = self.homeResponse
+        await self.beforeGetHomeReturn?()
+        if let error = shouldThrowError {
+            throw error
+        }
+        return response
+    }
+
+    func getHomeContinuation() async throws -> [HomeSection]? {
+        self.getHomeContinuationCalled = true
+        self.getHomeContinuationCallCount += 1
+        await self.beforeGetHomeContinuationReturn?()
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._homeContinuationIndex < self.homeContinuationSections.count else {
+            return nil
+        }
+        let sections = self.homeContinuationSections[self._homeContinuationIndex]
+        self._homeContinuationIndex += 1
+        return sections
+    }
+
+    func getPersonalizedRecommendations() async throws -> HomeResponse {
+        self.getPersonalizedRecommendationsCalled = true
+        self.getPersonalizedRecommendationsCallCount += 1
+        self._personalizedRecommendationsContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.personalizedRecommendationsResponse
+    }
+
+    func getPersonalizedRecommendationsContinuation() async throws -> [HomeSection]? {
+        self.getPersonalizedRecommendationsContinuationCalled = true
+        self.getPersonalizedRecommendationsContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._personalizedRecommendationsContinuationIndex < self.personalizedRecommendationsContinuationSections.count else {
+            return nil
+        }
+        let sections = self.personalizedRecommendationsContinuationSections[self._personalizedRecommendationsContinuationIndex]
+        self._personalizedRecommendationsContinuationIndex += 1
+        return sections
+    }
+
+    func getExplore() async throws -> HomeResponse {
+        self.getExploreCalled = true
+        self.getExploreCallCount += 1
+        self._exploreContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.exploreResponse
+    }
+
+    func getExploreContinuation() async throws -> [HomeSection]? {
+        self.getExploreContinuationCalled = true
+        self.getExploreContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._exploreContinuationIndex < self.exploreContinuationSections.count else {
+            return nil
+        }
+        let sections = self.exploreContinuationSections[self._exploreContinuationIndex]
+        self._exploreContinuationIndex += 1
+        return sections
+    }
+
+    func getCharts() async throws -> HomeResponse {
+        self.getChartsCalled = true
+        self.getChartsCallCount += 1
+        self._chartsContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.chartsResponse
+    }
+
+    func getChartsContinuation() async throws -> [HomeSection]? {
+        self.getChartsContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._chartsContinuationIndex < self.chartsContinuationSections.count else {
+            return nil
+        }
+        let sections = self.chartsContinuationSections[self._chartsContinuationIndex]
+        self._chartsContinuationIndex += 1
+        return sections
+    }
+
+    func getMoodsAndGenres() async throws -> HomeResponse {
+        self._moodsAndGenresContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.moodsAndGenresResponse
+    }
+
+    func getMoodsAndGenresContinuation() async throws -> [HomeSection]? {
+        self.getMoodsAndGenresContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._moodsAndGenresContinuationIndex < self.moodsAndGenresContinuationSections.count else {
+            return nil
+        }
+        let sections = self.moodsAndGenresContinuationSections[self._moodsAndGenresContinuationIndex]
+        self._moodsAndGenresContinuationIndex += 1
+        return sections
+    }
+
+    func getNewReleases() async throws -> HomeResponse {
+        self._newReleasesContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.newReleasesResponse
+    }
+
+    func getNewReleasesContinuation() async throws -> [HomeSection]? {
+        self.getNewReleasesContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._newReleasesContinuationIndex < self.newReleasesContinuationSections.count else {
+            return nil
+        }
+        let sections = self.newReleasesContinuationSections[self._newReleasesContinuationIndex]
+        self._newReleasesContinuationIndex += 1
+        return sections
+    }
+
+    func getHistory() async throws -> HomeResponse {
+        self.getHistoryCallCount += 1
+        self._historyContinuationIndex = 0
+        if self.shouldWaitForGetHistoryResponse {
+            await withCheckedContinuation { continuation in
+                self.getHistoryResponseContinuations.append(continuation)
+            }
+        }
+        if let getHistoryDelay {
+            try? await Task.sleep(for: getHistoryDelay)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        if !self.historyResponseSequence.isEmpty {
+            return self.historyResponseSequence.removeFirst()
+        }
+        return self.historyResponse
+    }
+
+    func getHistoryContinuation() async throws -> [HomeSection]? {
+        self.getHistoryContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._historyContinuationIndex < self.historyContinuationSections.count else {
+            return nil
+        }
+        let sections = self.historyContinuationSections[self._historyContinuationIndex]
+        self._historyContinuationIndex += 1
+        return sections
+    }
+
+    func getPodcasts() async throws -> [PodcastSection] {
+        self._podcastsContinuationIndex = 0
+        self.onGetPodcasts?()
+        if let delay = self.getPodcastsDelay {
+            try await Task.sleep(for: delay)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.podcastsSections
+    }
+
+    func getPodcastsContinuation() async throws -> [PodcastSection]? {
+        self.getPodcastsContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._podcastsContinuationIndex < self.podcastsContinuationSections.count else {
+            return nil
+        }
+        let sections = self.podcastsContinuationSections[self._podcastsContinuationIndex]
+        self._podcastsContinuationIndex += 1
+        return sections
+    }
+
+    func getPodcastShow(browseId _: String) async throws -> PodcastShowDetail {
+        if let error = shouldThrowError {
+            throw error
+        }
+        return PodcastShowDetail(
+            show: PodcastShow(id: "test", title: "Test Show", author: nil, description: nil, thumbnailURL: nil, episodeCount: nil),
+            episodes: [],
+            continuationToken: nil,
+            isSubscribed: false
+        )
+    }
+
+    func getPodcastEpisodesContinuation(token _: String) async throws -> PodcastEpisodesContinuation {
+        if let error = shouldThrowError {
+            throw error
+        }
+        return PodcastEpisodesContinuation(episodes: [], continuationToken: nil)
+    }
+
+    func search(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .mixed)
+        defer { self.completedSearchEndpoints.append(.mixed) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.mixedSearchResponse ?? self.searchResponse
+    }
+
+    func searchSongs(query: String) async throws -> [Song] {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .songs)
+        defer { self.completedSearchEndpoints.append(.songs) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        return (self.songsSearchResponse ?? self.searchResponse).songs
+    }
+
+    func searchSongsWithPagination(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .songsWithPagination)
+        defer { self.completedSearchEndpoints.append(.songsWithPagination) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.songsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            songs: response.songs,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchVideos(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .videos)
+        defer { self.completedSearchEndpoints.append(.videos) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.videosSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            videos: response.videos,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchAlbums(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .albums)
+        defer { self.completedSearchEndpoints.append(.albums) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.albumsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            albums: response.albums,
+            audiobooks: response.audiobooks,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchArtists(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .artists)
+        defer { self.completedSearchEndpoints.append(.artists) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.artistsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            artists: response.artists,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchProfiles(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .profiles)
+        defer { self.completedSearchEndpoints.append(.profiles) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.profilesSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            profiles: response.profiles,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchPlaylists(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .playlists)
+        defer { self.completedSearchEndpoints.append(.playlists) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.playlistsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            playlists: response.playlists,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchFeaturedPlaylists(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .featuredPlaylists)
+        defer { self.completedSearchEndpoints.append(.featuredPlaylists) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.featuredPlaylistsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            playlists: response.playlists,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchCommunityPlaylists(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .communityPlaylists)
+        defer { self.completedSearchEndpoints.append(.communityPlaylists) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.communityPlaylistsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            playlists: response.playlists,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchPodcasts(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .podcasts)
+        defer { self.completedSearchEndpoints.append(.podcasts) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.podcastsSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            podcastShows: response.podcastShows,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func searchEpisodes(query: String) async throws -> SearchResponse {
+        self.searchCalled = true
+        self.searchQueries.append(query)
+        await self.waitBeforeSearchReturn(query: query, endpoint: .episodes)
+        defer { self.completedSearchEndpoints.append(.episodes) }
+        if let error = shouldThrowError {
+            throw error
+        }
+        let response = self.episodesSearchResponse ?? self.searchResponse
+        return SearchResponse(
+            podcastEpisodes: response.podcastEpisodes,
+            continuationToken: response.continuationToken
+        )
+    }
+
+    func getSearchContinuation(token: String) async throws -> SearchResponse {
+        self.getSearchContinuationTokens.append(token)
+        if let beforeSearchContinuationReturn {
+            await beforeSearchContinuationReturn(token)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.searchContinuationResponses[token] ?? .empty
+    }
+
+    func resetSessionStateForAccountSwitch() {
+        self.resetSessionStateForAccountSwitchCalled = true
+        self.resetSessionStateForAccountSwitchCallCount += 1
+        self._homeContinuationIndex = 0
+        self._exploreContinuationIndex = 0
+        self._chartsContinuationIndex = 0
+        self._moodsAndGenresContinuationIndex = 0
+        self._newReleasesContinuationIndex = 0
+        self._historyContinuationIndex = 0
+        self._podcastsContinuationIndex = 0
+        self._likedSongsContinuationIndex = 0
+    }
+
+    func getSearchSuggestions(query: String) async throws -> [SearchSuggestion] {
+        self.getSearchSuggestionsCalled = true
+        self.getSearchSuggestionsQueries.append(query)
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.searchSuggestions
+    }
+
+    func getLibraryPlaylists() async throws -> [Playlist] {
+        self.getLibraryPlaylistsCalled = true
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.libraryPlaylists
+    }
+
+    func getLibraryContent() async throws -> PlaylistParser.LibraryContent {
+        self.getLibraryContentCalled = true
+        self.getLibraryContentCallCount += 1
+        self.onGetLibraryContent?()
+        if self.shouldWaitForLibraryContentResponse {
+            await withCheckedContinuation { continuation in
+                self.libraryContentResponseContinuations.append(continuation)
+            }
+        }
+        if !self.libraryContentResponseDelays.isEmpty {
+            let delay = self.libraryContentResponseDelays.removeFirst()
+            try? await Task.sleep(for: delay)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        if !self.libraryContentResponses.isEmpty {
+            return self.libraryContentResponses.removeFirst()
+        }
+        return PlaylistParser.LibraryContent(
+            playlists: self.libraryPlaylists,
+            albums: self.libraryAlbums,
+            artists: self.libraryArtists,
+            podcastShows: self.libraryPodcastShows,
+            uploadedSongsPlaylist: self.uploadedSongsPlaylist
+        )
+    }
+
+    func resumeNextLibraryContentResponse() {
+        guard !self.libraryContentResponseContinuations.isEmpty else { return }
+        self.libraryContentResponseContinuations.removeFirst().resume()
+    }
+
+    func getLikedSongs() async throws -> LikedSongsResponse {
+        self.getLikedSongsCalled = true
+        self._likedSongsContinuationIndex = 0
+        if let error = shouldThrowError {
+            throw error
+        }
+        let hasMore = !self.likedSongsContinuationSongs.isEmpty
+        return LikedSongsResponse(songs: self.likedSongs, continuationToken: hasMore ? "mock-token" : nil)
+    }
+
+    func getLikedSongsContinuation() async throws -> LikedSongsResponse? {
+        self.getLikedSongsContinuationCalled = true
+        self.getLikedSongsContinuationCallCount += 1
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard self._likedSongsContinuationIndex < self.likedSongsContinuationSongs.count else {
+            return nil
+        }
+        let songs = self.likedSongsContinuationSongs[self._likedSongsContinuationIndex]
+        self._likedSongsContinuationIndex += 1
+        let hasMore = self._likedSongsContinuationIndex < self.likedSongsContinuationSongs.count
+        return LikedSongsResponse(songs: songs, continuationToken: hasMore ? "mock-token-\(self._likedSongsContinuationIndex)" : nil)
+    }
+
+    func getPlaylist(id: String) async throws -> PlaylistTracksResponse {
+        self.getPlaylistCalled = true
+        self.getPlaylistIds.append(id)
+        await self.getPlaylistGate?.wait()
+        if let getPlaylistDelay {
+            try? await Task.sleep(for: getPlaylistDelay)
+        }
+        if let beforeGetPlaylistReturn {
+            await beforeGetPlaylistReturn(id)
+        }
+        if let getPlaylistError {
+            throw getPlaylistError
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard let detail = playlistDetails[id] else {
+            throw YTMusicError.parseError(message: "Playlist not found: \(id)")
+        }
+        let hasContinuation = self.playlistContinuationTracks[id]?.isEmpty == false
+        return PlaylistTracksResponse(
+            detail: detail,
+            continuationToken: hasContinuation ? Self.playlistContinuationToken(playlistId: id, index: 0) : nil
+        )
+    }
+
+    func getPlaylistContinuation(token: String, requiresAuth: Bool) async throws -> PlaylistContinuationResponse {
+        self.getPlaylistContinuationCalled = true
+        self.getPlaylistContinuationCallCount += 1
+        self.getPlaylistContinuationTokens.append(token)
+        self.getPlaylistContinuationRequiresAuthFlags.append(requiresAuth)
+        defer {
+            self.getPlaylistContinuationReturnCount += 1
+        }
+        if let playlistContinuationDelay {
+            try? await Task.sleep(for: playlistContinuationDelay)
+        }
+        if let beforePlaylistContinuationReturn {
+            await beforePlaylistContinuationReturn(token)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        if !self.forcedPlaylistContinuationResponses.isEmpty {
+            return self.forcedPlaylistContinuationResponses.removeFirst()
+        }
+        guard let (playlistId, index) = Self.parsePlaylistContinuationToken(token),
+              let continuations = playlistContinuationTracks[playlistId],
+              index < continuations.count
+        else {
+            return PlaylistContinuationResponse(tracks: [], continuationToken: nil)
+        }
+        let tracks = continuations[index]
+        let nextIndex = index + 1
+        let hasMore = nextIndex < continuations.count
+        return PlaylistContinuationResponse(
+            tracks: tracks,
+            continuationToken: hasMore ? Self.playlistContinuationToken(playlistId: playlistId, index: nextIndex) : nil
+        )
+    }
+
+    func getPlaylistAllTracks(playlistId: String) async throws -> [Song] {
+        if let error = shouldThrowError {
+            throw error
+        }
+        if let tracks = self.playlistAllTracks[playlistId] {
+            return tracks
+        }
+        guard let detail = playlistDetails[playlistId] else {
+            throw YTMusicError.parseError(message: "Playlist not found: \(playlistId)")
+        }
+        var allTracks = detail.tracks
+        if let continuations = playlistContinuationTracks[playlistId] {
+            for batch in continuations {
+                allTracks.append(contentsOf: batch)
+            }
+        }
+        return allTracks
+    }
+
+    func getArtist(id: String) async throws -> ArtistDetail {
+        self.getArtistCalled = true
+        self.getArtistIds.append(id)
+        if let error = shouldThrowError {
+            throw error
+        }
+        guard let detail = artistDetails[id] else {
+            throw YTMusicError.parseError(message: "Artist not found: \(id)")
+        }
+        return detail
+    }
+
+    func getArtistSongs(browseId: String, params _: String?) async throws -> [Song] {
+        self.getArtistSongsCalled = true
+        self.getArtistSongsBrowseIds.append(browseId)
+        if let error = shouldThrowError {
+            throw error
+        }
+        // Return artistSongsResponse if set, otherwise fall back to dictionary lookup
+        if !self.artistSongsResponse.isEmpty {
+            return self.artistSongsResponse
+        }
+        return self.artistSongs[browseId] ?? []
+    }
+
+    func getArtistDiscography(browseId _: String, params _: String?) async throws -> [Album] {
+        if let error = shouldThrowError {
+            throw error
+        }
+        return []
+    }
+
+    func getArtistEpisodesList(browseId _: String, params _: String?) async throws -> [ArtistEpisode] {
+        if let error = shouldThrowError {
+            throw error
+        }
+        return []
+    }
+
+    func rateSong(videoId: String, rating: LikeStatus) async throws {
+        self.rateSongCalled = true
+        self.rateSongVideoIds.append(videoId)
+        self.rateSongRatings.append(rating)
+        if let rateSongDelay = self.rateSongDelay {
+            try? await Task.sleep(for: rateSongDelay)
+        }
+        if let beforeRateSongReturn {
+            await beforeRateSongReturn(videoId, rating)
+        }
+        if !self.rateSongErrors.isEmpty, let error = self.rateSongErrors.removeFirst() {
+            throw error
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        self.appliedRateSongRatings.append(rating)
+    }
+
+    func editSongLibraryStatus(feedbackTokens: [String]) async throws {
+        self.editSongLibraryStatusCalled = true
+        self.editSongLibraryStatusTokens.append(feedbackTokens)
+        if !self.editSongLibraryStatusResponseDelays.isEmpty {
+            let delay = self.editSongLibraryStatusResponseDelays.removeFirst()
+            try? await Task.sleep(for: delay)
+        }
+        if let beforeEditSongLibraryStatusReturn {
+            await beforeEditSongLibraryStatusReturn(feedbackTokens)
+        }
+        if !self.editSongLibraryStatusErrors.isEmpty,
+           let error = self.editSongLibraryStatusErrors.removeFirst()
+        {
+            throw error
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        self.appliedEditSongLibraryStatusTokens.append(feedbackTokens)
+    }
+
+    func subscribeToPlaylist(playlistId: String) async throws {
+        self.subscribeToPlaylistCalled = true
+        self.subscribeToPlaylistIds.append(playlistId)
+        if let beforeSubscribeToPlaylistReturn {
+            await beforeSubscribeToPlaylistReturn(playlistId)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let playlistKey = LibraryContentIdentity.playlistKey(for: playlistId)
+        if self.shouldAutoUpdatePlaylistLibraryOnMutation,
+           !self.libraryPlaylists.contains(where: { LibraryContentIdentity.playlistKey(for: $0.id) == playlistKey })
+        {
+            self.libraryPlaylists.insert(TestFixtures.makePlaylist(id: playlistId), at: 0)
+        }
+    }
+
+    func deletePlaylist(playlistId: String) async throws {
+        self.deletePlaylistCalled = true
+        self.deletePlaylistIds.append(playlistId)
+        if let beforeDeletePlaylistReturn {
+            await beforeDeletePlaylistReturn(playlistId)
+            try Task.checkCancellation()
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let playlistKey = LibraryContentIdentity.playlistKey(for: playlistId)
+        if self.shouldAutoUpdatePlaylistLibraryOnMutation {
+            self.libraryPlaylists.removeAll { LibraryContentIdentity.playlistKey(for: $0.id) == playlistKey }
+        }
+        self.playlistDetails = self.playlistDetails.filter { entry in
+            LibraryContentIdentity.playlistKey(for: entry.key) != playlistKey
+                && LibraryContentIdentity.playlistKey(for: entry.value.id) != playlistKey
+        }
+    }
+
+    func getAddToPlaylistOptions(videoId: String) async throws -> AddToPlaylistMenu {
+        self.getAddToPlaylistOptionsVideoIds.append(videoId)
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.addToPlaylistMenus[videoId] ?? self.defaultAddToPlaylistMenu
+    }
+
+    func createPlaylist(
+        title: String,
+        description: String?,
+        privacyStatus: PlaylistPrivacyStatus,
+        videoIds: [String]
+    ) async throws -> String {
+        self.createPlaylistCalls.append(CreatePlaylistCall(
+            title: title,
+            description: description,
+            privacyStatus: privacyStatus,
+            videoIds: videoIds
+        ))
+        await self.beforeCreatePlaylistReturn?()
+        if let error = shouldThrowError {
+            throw error
+        }
+        return "PLCREATED"
+    }
+
+    func addSongToPlaylist(videoId: String, playlistId: String, allowDuplicate: Bool) async throws {
+        self.addSongToPlaylistCalls.append(AddSongToPlaylistCall(videoId: videoId, playlistId: playlistId, allowDuplicate: allowDuplicate))
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let playlistKey = LibraryContentIdentity.playlistKey(for: playlistId)
+        guard self.shouldAutoUpdatePlaylistLibraryOnMutation,
+              let song = self.songResponses[videoId]
+        else { return }
+
+        for (key, detail) in self.playlistDetails where LibraryContentIdentity.playlistKey(for: key) == playlistKey || LibraryContentIdentity.playlistKey(for: detail.id) == playlistKey {
+            if !detail.tracks.contains(where: { $0.videoId == videoId }) {
+                let playlist = Playlist(
+                    id: detail.id,
+                    title: detail.title,
+                    description: detail.description,
+                    thumbnailURL: detail.thumbnailURL,
+                    trackCount: detail.trackCount.map { $0 + 1 },
+                    author: detail.author
+                )
+                self.playlistDetails[key] = PlaylistDetail(
+                    playlist: playlist,
+                    tracks: detail.tracks + [song],
+                    duration: detail.duration
+                )
+            }
+        }
+    }
+
+    func removeSongFromPlaylist(videoId: String, setVideoId: String, playlistId: String) async throws {
+        self.removeSongFromPlaylistCalls.append(RemoveSongFromPlaylistCall(videoId: videoId, setVideoId: setVideoId, playlistId: playlistId))
+        if self.shouldWaitForRemoveSongFromPlaylistResponse {
+            await withCheckedContinuation { continuation in
+                self.removeSongFromPlaylistResponseContinuations.append(continuation)
+            }
+        }
+        if let removeSongFromPlaylistError {
+            throw removeSongFromPlaylistError
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let playlistKey = LibraryContentIdentity.playlistKey(for: playlistId)
+        guard self.shouldAutoUpdatePlaylistLibraryOnMutation else { return }
+
+        for (key, detail) in self.playlistDetails where LibraryContentIdentity.playlistKey(for: key) == playlistKey || LibraryContentIdentity.playlistKey(for: detail.id) == playlistKey {
+            let playlist = Playlist(
+                id: detail.id,
+                title: detail.title,
+                description: detail.description,
+                thumbnailURL: detail.thumbnailURL,
+                trackCount: detail.trackCount.map { max(0, $0 - 1) },
+                author: detail.author
+            )
+            self.playlistDetails[key] = PlaylistDetail(
+                playlist: playlist,
+                tracks: detail.tracks.filter { $0.playlistSetVideoId != setVideoId },
+                duration: detail.duration
+            )
+        }
+    }
+
+    func resumeNextGetHistoryResponse() {
+        guard !self.getHistoryResponseContinuations.isEmpty else { return }
+        self.getHistoryResponseContinuations.removeFirst().resume()
+    }
+
+    func resumeNextRemoveSongFromPlaylistResponse() {
+        guard !self.removeSongFromPlaylistResponseContinuations.isEmpty else { return }
+        self.removeSongFromPlaylistResponseContinuations.removeFirst().resume()
+    }
+
+    func unsubscribeFromPlaylist(playlistId: String) async throws {
+        self.unsubscribeFromPlaylistCalled = true
+        self.unsubscribeFromPlaylistIds.append(playlistId)
+        if let beforeUnsubscribeFromPlaylistReturn {
+            await beforeUnsubscribeFromPlaylistReturn(playlistId)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let playlistKey = LibraryContentIdentity.playlistKey(for: playlistId)
+        if self.shouldAutoUpdatePlaylistLibraryOnMutation {
+            self.libraryPlaylists.removeAll { LibraryContentIdentity.playlistKey(for: $0.id) == playlistKey }
+        }
+    }
+
+    func subscribeToPodcast(showId: String) async throws {
+        if let beforeSubscribeToPodcastReturn {
+            await beforeSubscribeToPodcastReturn(showId)
+        }
+        if let subscribeToPodcastDelay {
+            try? await Task.sleep(for: subscribeToPodcastDelay)
+        }
+        try Task.checkCancellation()
+        if let error = shouldThrowError {
+            throw error
+        }
+        // Validate podcast show ID format (mirrors real YTMusicClient behavior)
+        if showId.hasPrefix("MPSPP") {
+            let suffix = String(showId.dropFirst(5))
+            if suffix.isEmpty {
+                throw YTMusicError.invalidInput("Invalid podcast show ID: \(showId)")
+            }
+            if !suffix.hasPrefix("L") {
+                throw YTMusicError.invalidInput("Invalid podcast show ID format: \(showId)")
+            }
+        }
+
+        if self.shouldAutoUpdatePodcastLibraryOnMutation,
+           !self.libraryPodcastShows.contains(where: { $0.id == showId })
+        {
+            self.libraryPodcastShows.insert(TestFixtures.makePodcastShow(id: showId), at: 0)
+        }
+    }
+
+    func unsubscribeFromPodcast(showId: String) async throws {
+        if let beforeUnsubscribeFromPodcastReturn {
+            await beforeUnsubscribeFromPodcastReturn(showId)
+        }
+        if let unsubscribeFromPodcastDelay {
+            try? await Task.sleep(for: unsubscribeFromPodcastDelay)
+        }
+        try Task.checkCancellation()
+        if let error = shouldThrowError {
+            throw error
+        }
+        // Validate podcast show ID format (mirrors real YTMusicClient behavior)
+        if showId.hasPrefix("MPSPP") {
+            let suffix = String(showId.dropFirst(5))
+            if suffix.isEmpty {
+                throw YTMusicError.invalidInput("Invalid podcast show ID: \(showId)")
+            }
+            if !suffix.hasPrefix("L") {
+                throw YTMusicError.invalidInput("Invalid podcast show ID format: \(showId)")
+            }
+        }
+
+        if self.shouldAutoUpdatePodcastLibraryOnMutation {
+            self.libraryPodcastShows.removeAll { $0.id == showId }
+        }
+    }
+
+    func subscribeToArtist(channelId: String) async throws {
+        self.subscribeToArtistCalled = true
+        self.subscribeToArtistIds.append(channelId)
+        if let delay = self.subscribeToArtistDelay {
+            try? await Task.sleep(for: delay)
+        }
+        try Task.checkCancellation()
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let artistKey = LibraryContentIdentity.artistKey(for: channelId)
+        let artist = self.artistDetails.values.first(where: { $0.channelId == channelId })?.artist
+            ?? TestFixtures.makeArtist(id: "MPLA\(channelId)")
+
+        if self.shouldAutoUpdateArtistLibraryOnMutation,
+           !self.libraryArtists.contains(where: { LibraryContentIdentity.artistKey(for: $0.id) == artistKey })
+        {
+            self.libraryArtists.insert(artist, at: 0)
+        }
+    }
+
+    func unsubscribeFromArtist(channelId: String) async throws {
+        self.unsubscribeFromArtistCalled = true
+        self.unsubscribeFromArtistIds.append(channelId)
+        if let delay = self.unsubscribeFromArtistDelay {
+            try? await Task.sleep(for: delay)
+        }
+        try Task.checkCancellation()
+        if let error = shouldThrowError {
+            throw error
+        }
+
+        let artistKey = LibraryContentIdentity.artistKey(for: channelId)
+        if self.shouldAutoUpdateArtistLibraryOnMutation {
+            self.libraryArtists.removeAll { LibraryContentIdentity.artistKey(for: $0.id) == artistKey }
+        }
+    }
+
+    func getLyrics(videoId: String) async throws -> Lyrics {
+        self.getLyricsCalled = true
+        self.getLyricsVideoIds.append(videoId)
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.lyricsResponses[videoId] ?? .unavailable
+    }
+
+    func getTimedLyrics(videoId _: String) async throws -> LyricResult {
+        if let error = shouldThrowError {
+            throw error
+        }
+        return .unavailable
+    }
+
+    func getSong(videoId: String) async throws -> Song {
+        self.getSongCalled = true
+        self.getSongVideoIds.append(videoId)
+        let callCount = self.getSongVideoIds.count
+        if let getSongDelay = self.getSongDelay {
+            try? await Task.sleep(for: getSongDelay)
+        }
+        if let beforeGetSongReturn {
+            await beforeGetSongReturn(videoId)
+        }
+        if let error = self.getSongErrorsByCallCount[callCount] {
+            throw error
+        }
+        if !self.getSongErrors.isEmpty {
+            throw self.getSongErrors.removeFirst()
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.songResponses[videoId] ?? Song(
+            id: videoId,
+            title: "Mock Song",
+            artists: [Artist(id: "mock-artist", name: "Mock Artist")],
+            videoId: videoId
+        )
+    }
+
+    func getRadioQueue(videoId: String) async throws -> [Song] {
+        self.getRadioQueueCalled = true
+        self.getRadioQueueVideoIds.append(videoId)
+        await self.getRadioQueueGate?.wait()
+        if let getRadioQueueDelay {
+            try? await Task.sleep(for: getRadioQueueDelay)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        if let error = radioQueueErrors[videoId] {
+            throw error
+        }
+        await self.waitBeforeRadioQueueReturn(videoId: videoId)
+        return self.radioQueueSongs[videoId] ?? []
+    }
+
+    func getMixQueue(playlistId: String, startVideoId: String?) async throws -> RadioQueueResult {
+        self.getMixQueueCallCount += 1
+        await self.mixQueueGate?.wait()
+        if let mixQueueDelay {
+            try? await Task.sleep(for: mixQueueDelay)
+        }
+        if let error = shouldThrowError {
+            throw error
+        }
+        await self.waitBeforeMixQueueReturn(playlistId: playlistId, startVideoId: startVideoId)
+        return self.mixQueueResult
+    }
+
+    func getMixQueueContinuation(continuationToken continuation: String) async throws -> RadioQueueResult {
+        self.getMixQueueContinuationCallCount += 1
+        let result = if self.mixQueueContinuationResults.isEmpty {
+            self.mixQueueContinuationResult
+        } else {
+            self.mixQueueContinuationResults.removeFirst()
+        }
+        await self.mixQueueContinuationGate?.wait()
+        if let error = shouldThrowError {
+            throw error
+        }
+        await self.waitBeforeMixQueueContinuationReturn(continuation)
+        return result
+    }
+
+    func getMoodCategory(browseId: String, params: String?) async throws -> HomeResponse {
+        self.moodCategoryCalled = true
+        self.moodCategoryBrowseIds.append(browseId)
+        self.moodCategoryParams.append(params)
+        if let error = shouldThrowError {
+            throw error
+        }
+        if let moodCategoryError {
+            throw moodCategoryError
+        }
+        if let response = moodCategoryResponses[params ?? ""] {
+            return response
+        }
+        return self.moodCategoryResponse
+    }
+
+    func fetchAccountsList(allowGuestMode _: Bool) async throws -> AccountsListResponse {
+        self.fetchAccountsListCallCount += 1
+        await self.accountsListStartedGate?.open()
+        await self.accountsListReleaseGate?.wait()
+        if let error = shouldThrowError {
+            throw error
+        }
+        return self.accountsListResponse
+    }
+
+    // MARK: - Helper Methods
+
+    /// Resets all call tracking.
+    func reset() { // swiftlint:disable:this function_body_length
+        self.getHomeCalled = false
+        self.getHomeCallCount = 0
+        self.getHomeForceRefreshes = []
+        self.getHomeContinuationCalled = false
+        self.getHomeContinuationCallCount = 0
+        self._homeContinuationIndex = 0
+        self.getPersonalizedRecommendationsCalled = false
+        self.getPersonalizedRecommendationsCallCount = 0
+        self.getPersonalizedRecommendationsContinuationCalled = false
+        self.getPersonalizedRecommendationsContinuationCallCount = 0
+        self.getPodcastsContinuationCallCount = 0
+        self._personalizedRecommendationsContinuationIndex = 0
+        self.getExploreCalled = false
+        self.getExploreCallCount = 0
+        self.getExploreContinuationCalled = false
+        self.getExploreContinuationCallCount = 0
+        self._exploreContinuationIndex = 0
+        self.getChartsCalled = false
+        self.getChartsCallCount = 0
+        self.getChartsContinuationCallCount = 0
+        self.getMoodsAndGenresContinuationCallCount = 0
+        self.getNewReleasesContinuationCallCount = 0
+        self.getHistoryContinuationCallCount = 0
+        self._chartsContinuationIndex = 0
+        self._moodsAndGenresContinuationIndex = 0
+        self._newReleasesContinuationIndex = 0
+        self._historyContinuationIndex = 0
+        self._podcastsContinuationIndex = 0
+        self._likedSongsContinuationIndex = 0
+        self.searchCalled = false
+        self.searchQueries = []
+        self.completedSearchEndpoints = []
+        self.getSearchContinuationTokens = []
+        self.beforeSearchReturn = nil
+        self.beforeSearchContinuationReturn = nil
+        self.beforeGetSongReturn = nil
+        self.beforeGetPlaylistReturn = nil
+        self.beforePlaylistContinuationReturn = nil
+        self.beforeMixQueueReturn = nil
+        self.beforeMixQueueContinuationReturn = nil
+        self.beforeRadioQueueReturn = nil
+        self.beforeRateSongReturn = nil
+        self.beforeEditSongLibraryStatusReturn = nil
+        self.getSearchSuggestionsCalled = false
+        self.getSearchSuggestionsQueries = []
+        self.getLibraryContentCalled = false
+        self.getLibraryContentCallCount = 0
+        self.libraryContentResponses = []
+        self.libraryContentResponseDelays = []
+        self.shouldWaitForLibraryContentResponse = false
+        while !self.libraryContentResponseContinuations.isEmpty {
+            self.libraryContentResponseContinuations.removeFirst().resume()
+        }
+        self.onGetLibraryContent = nil
+        self.beforeGetHomeReturn = nil
+        self.beforeGetHomeContinuationReturn = nil
+        self.fetchAccountsListCallCount = 0
+        self.accountsListStartedGate = nil
+        self.accountsListReleaseGate = nil
+        self.getLibraryPlaylistsCalled = false
+        self.getLikedSongsCalled = false
+        self.getLikedSongsContinuationCalled = false
+        self.getLikedSongsContinuationCallCount = 0
+        self.getPlaylistCalled = false
+        self.getPlaylistIds = []
+        self.getPlaylistDelay = nil
+        self.getPlaylistContinuationCalled = false
+        self.getPlaylistContinuationCallCount = 0
+        self.getPlaylistContinuationTokens = []
+        self.getPlaylistContinuationRequiresAuthFlags = []
+        self.playlistAllTracks = [:]
+        self.getArtistCalled = false
+        self.getArtistIds = []
+        self.getArtistSongsCalled = false
+        self.getArtistSongsBrowseIds = []
+        self.rateSongCalled = false
+        self.rateSongVideoIds = []
+        self.rateSongRatings = []
+        self.appliedRateSongRatings = []
+        self.resetSessionStateForAccountSwitchCalled = false
+        self.resetSessionStateForAccountSwitchCallCount = 0
+        self.editSongLibraryStatusCalled = false
+        self.editSongLibraryStatusTokens = []
+        self.appliedEditSongLibraryStatusTokens = []
+        self.subscribeToPlaylistCalled = false
+        self.subscribeToPlaylistIds = []
+        self.deletePlaylistCalled = false
+        self.deletePlaylistIds = []
+        self.getAddToPlaylistOptionsVideoIds = []
+        self.createPlaylistCalls = []
+        self.beforeCreatePlaylistReturn = nil
+        self.addSongToPlaylistCalls = []
+        self.addToPlaylistMenus = [:]
+        self.defaultAddToPlaylistMenu = AddToPlaylistMenu(title: nil, options: [], canCreatePlaylist: false)
+        self.unsubscribeFromPlaylistCalled = false
+        self.unsubscribeFromPlaylistIds = []
+        self.beforeSubscribeToPlaylistReturn = nil
+        self.beforeUnsubscribeFromPlaylistReturn = nil
+        self.beforeDeletePlaylistReturn = nil
+        self.beforeSubscribeToPodcastReturn = nil
+        self.beforeUnsubscribeFromPodcastReturn = nil
+        self.subscribeToPodcastDelay = nil
+        self.unsubscribeFromPodcastDelay = nil
+        self.subscribeToArtistDelay = nil
+        self.subscribeToArtistCalled = false
+        self.subscribeToArtistIds = []
+        self.unsubscribeFromArtistCalled = false
+        self.unsubscribeFromArtistIds = []
+        self.unsubscribeFromArtistDelay = nil
+        self.rateSongDelay = nil
+        self.rateSongErrors = []
+        self.editSongLibraryStatusResponseDelays = []
+        self.editSongLibraryStatusErrors = []
+        self.getSongDelay = nil
+        self.getHistoryDelay = nil
+        self.shouldWaitForGetHistoryResponse = false
+        while !self.getHistoryResponseContinuations.isEmpty {
+            self.getHistoryResponseContinuations.removeFirst().resume()
+        }
+        self.getPlaylistGate = nil
+        self.resetQueueFetchState()
+        self.getLyricsCalled = false
+        self.getLyricsVideoIds = []
+        self.getRadioQueueCalled = false
+        self.getRadioQueueVideoIds = []
+        self.moodCategoryCalled = false
+        self.moodCategoryBrowseIds = []
+        self.moodCategoryParams = []
+        self.shouldThrowError = nil
+    }
+
+    private func resetQueueFetchState() {
+        self.getSongDelay = nil
+        self.getSongErrors = []
+        self.mixQueueDelay = nil
+        self.mixQueueGate = nil
+        self.mixQueueContinuationGate = nil
+        self.getRadioQueueDelay = nil
+        self.getRadioQueueGate = nil
+        self.mixQueueResult = RadioQueueResult(songs: [], continuationToken: nil)
+        self.mixQueueContinuationResult = RadioQueueResult(songs: [], continuationToken: nil)
+        self.mixQueueContinuationResults = []
+        self.getMixQueueCallCount = 0
+        self.getMixQueueContinuationCallCount = 0
+    }
+}

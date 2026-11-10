@@ -1,0 +1,103 @@
+name: Dev Build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.swift"
+      - "Package.swift"
+      - "Info.plist"
+      - "Kaset.entitlements"
+      - "Sources/**"
+      - "Tests/**"
+      - "Scripts/**"
+      - ".github/workflows/dev-build.yml"
+  pull_request:
+    paths:
+      - "**.swift"
+      - "Package.swift"
+      - "Info.plist"
+      - "Kaset.entitlements"
+      - "Sources/**"
+      - "Tests/**"
+      - "Scripts/**"
+      - ".github/workflows/dev-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Cache SPM dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm/spm-repositories
+          key: ${{ runner.os }}-spm-build-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-build-
+
+      - name: Clear SPM binary artifacts cache
+        run: rm -rf ~/Library/Caches/org.swift.swiftpm/artifacts
+
+      - name: Get short SHA
+        id: slug
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build app
+        env:
+          # Ad-hoc builds list App Intents in Shortcuts but macOS will not run them.
+          KASET_SIGNING: adhoc
+          ARCHES: "arm64 x86_64"
+        run: |
+          # Override version for dev builds
+          echo "MARKETING_VERSION=0.0.0-dev.${{ steps.slug.outputs.sha_short }}" > version.env
+          echo "BUILD_NUMBER=${{ github.run_number }}" >> version.env
+          Scripts/build-app.sh release
+
+      - name: Verify packaged app
+        run: Scripts/verify-release-app.sh .build/app/Kaset.app
+
+      - name: Create DMG
+        run: |
+          APP_PATH=".build/app/Kaset.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: Could not find Kaset.app"
+            exit 1
+          fi
+
+          echo "Found app at: $APP_PATH"
+
+          # Create a temporary directory for DMG contents
+          mkdir -p dmg_contents
+          cp -R "$APP_PATH" dmg_contents/
+
+          # Create DMG
+          hdiutil create -volname "Kaset-dev" \
+            -srcfolder dmg_contents \
+            -ov -format UDZO \
+            kaset-dev.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: kaset-dev-${{ steps.slug.outputs.sha_short }}
+          path: kaset-dev.dmg
+          retention-days: 30

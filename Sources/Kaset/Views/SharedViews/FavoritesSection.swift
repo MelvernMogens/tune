@@ -1,0 +1,290 @@
+import SwiftUI
+import UniformTypeIdentifiers
+
+// MARK: - FavoritesSection
+
+/// A horizontal scrolling section displaying pinned Favorites items.
+/// Supports drag-and-drop reordering and context menu actions.
+struct FavoritesSection: View {
+    @Environment(PlayerService.self) private var playerService
+    @Environment(FavoritesManager.self) private var favoritesManager
+    @State private var draggedItem: FavoriteItem?
+    @State private var navigationPath: NavigationPath?
+
+    /// Binding to navigation path for navigation within the section.
+    var onNavigate: ((any Hashable) -> Void)?
+
+    /// Resting horizontal inset for the shelf content, so items rest clear of
+    /// the floating glass sidebar while still scrolling underneath it.
+    /// Defaults to `0` (edge-to-edge) to preserve existing call sites.
+    var contentInset: CGFloat = 0
+
+    var body: some View {
+        CarouselShelfSection(
+            accessibilityLabel: String(localized: "Favorites"),
+            items: self.favoritesManager.items,
+            showsControls: self.draggedItem == nil,
+            contentInset: self.contentInset
+        ) {
+            Text(String(localized: "Favorites"))
+                .font(.title2)
+                .fontWeight(.semibold)
+        } itemContent: { item in
+            FavoriteItemCard(
+                item: item,
+                onTap: { self.handleTap(item) }
+            )
+            .draggable(item) {
+                self.dragPreview(for: item)
+            }
+            .dropDestination(for: FavoriteItem.self) { droppedItems, _ in
+                defer { self.draggedItem = nil }
+                return self.handleDrop(droppedItems, on: item)
+            }
+            .contextMenu {
+                self.contextMenu(for: item)
+            }
+        }
+    }
+
+    private func dragPreview(for item: FavoriteItem) -> some View {
+        FavoriteItemCard(item: item, onTap: {})
+            .opacity(0.8)
+            .onAppear {
+                self.draggedItem = item
+            }
+            .onDisappear {
+                if self.draggedItem == item {
+                    self.draggedItem = nil
+                }
+            }
+    }
+
+    // MARK: - Actions
+
+    private func handleTap(_ item: FavoriteItem) {
+        switch item.itemType {
+        case let .song(song):
+            Task {
+                await self.playerService.playWithRadio(song: song)
+            }
+        case let .album(album):
+            let playlist = Playlist(
+                id: album.id,
+                title: album.title,
+                description: nil,
+                thumbnailURL: album.thumbnailURL,
+                trackCount: album.trackCount,
+                author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
+            )
+            self.onNavigate?(playlist)
+        case let .playlist(playlist):
+            self.onNavigate?(playlist)
+        case let .artist(artist):
+            self.onNavigate?(artist)
+        case let .podcastShow(show):
+            self.onNavigate?(show)
+        }
+    }
+
+    private func handleDrop(_ droppedItems: [FavoriteItem], on target: FavoriteItem) -> Bool {
+        guard self.favoritesManager.canMutate,
+              let droppedItem = droppedItems.first,
+              let sourceIndex = favoritesManager.items.firstIndex(of: droppedItem),
+              let targetIndex = favoritesManager.items.firstIndex(of: target),
+              sourceIndex != targetIndex
+        else {
+            return false
+        }
+
+        // Calculate the proper destination index
+        let destinationIndex = sourceIndex < targetIndex ? targetIndex + 1 : targetIndex
+        self.favoritesManager.move(from: IndexSet(integer: sourceIndex), to: destinationIndex)
+        return true
+    }
+
+    // MARK: - Context Menu
+
+    @ViewBuilder
+    private func contextMenu(for item: FavoriteItem) -> some View {
+        let client = self.playerService.ytMusicClient
+
+        switch item.itemType {
+        case let .song(song):
+            SongContextMenu(song: song, client: client, play: { self.handleTap(item) }, navigate: self.onNavigate)
+        case let .album(album):
+            if let client {
+                AlbumContextMenu(album: album, client: client, navigate: self.onNavigate)
+            }
+        case let .playlist(playlist):
+            if let client {
+                PlaylistContextMenu(playlist: playlist, client: client, navigate: self.onNavigate)
+            }
+        case let .artist(artist):
+            ArtistContextMenu(artist: artist, navigate: self.onNavigate)
+        case let .podcastShow(show):
+            PodcastShowContextMenu(show: show, navigate: self.onNavigate)
+        }
+
+        if self.favoritesManager.canMutate {
+            Divider()
+
+            Button {
+                self.favoritesManager.moveToTop(contentId: item.contentId)
+            } label: {
+                Label(String(localized: "Move to Top"), systemImage: "arrow.up.to.line")
+            }
+
+            Button {
+                self.favoritesManager.moveToEnd(contentId: item.contentId)
+            } label: {
+                Label(String(localized: "Move to End"), systemImage: "arrow.down.to.line")
+            }
+        }
+    }
+}
+
+// MARK: - FavoriteItemCard
+
+/// A card view for a single Favorites item.
+private struct FavoriteItemCard: View {
+    let item: FavoriteItem
+    let onTap: () -> Void
+
+    private static let cardWidth: CGFloat = 160
+    private static let cardHeight: CGFloat = 160
+    private static let thumbnailTargetSize = CGSize(width: cardWidth, height: cardHeight)
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: self.onTap) {
+            VStack(alignment: .leading, spacing: 8) {
+                self.thumbnail
+                self.titleAndSubtitle
+            }
+        }
+        .buttonStyle(.interactiveCard)
+        .onHover { hovering in
+            withAnimation(AppAnimation.quick) {
+                self.isHovering = hovering
+            }
+        }
+        .accessibilityLabel("\(self.item.title), \(self.item.typeLabel), \(self.item.subtitle ?? "")")
+        .accessibilityHint(String(localized: "Drag to reorder"))
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            if let url = item.thumbnailURL?.highQualityThumbnailURL {
+                CachedAsyncImage(url: url, targetSize: Self.thumbnailTargetSize) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    self.placeholderView
+                }
+            } else {
+                self.placeholderView
+            }
+        }
+        .frame(width: Self.cardWidth, height: Self.cardHeight)
+        .clipShape(.tuneRounded(HomeItemCell.cornerRadius))
+        .overlay {
+            RoundedRectangle.tuneRounded(HomeItemCell.cornerRadius)
+                .strokeBorder(self.isHovering ? TuneTheme.Palette.ink.opacity(0.7) : TuneTheme.Palette.artworkEdge, lineWidth: 1)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottomLeading) {
+            // C2 hover play: the same small flat square as the shelf cards (songs only).
+            if case .song = self.item.itemType, self.isHovering {
+                SongCoverPlayOverlay(size: CGSize(width: HomeItemCell.playOverlaySize, height: HomeItemCell.playOverlaySize))
+                    .padding(HomeItemCell.playOverlayInset)
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    private var placeholderView: some View {
+        Rectangle()
+            .fill(Self.gradientForTitle(self.item.title))
+            .overlay {
+                Image(systemName: self.placeholderIcon)
+                    .font(.system(size: 36))
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+    }
+
+    private var placeholderIcon: String {
+        switch self.item.itemType {
+        case .song: "music.note"
+        case .album: "square.stack"
+        case .playlist: "music.note.list"
+        case .artist: "person.fill"
+        case .podcastShow: "mic.fill"
+        }
+    }
+
+    private static func gradientForTitle(_ title: String) -> LinearGradient {
+        let hash = abs(title.hashValue)
+        let hue1 = Double(hash % 360) / 360.0
+        let hue2 = (hue1 + 0.1).truncatingRemainder(dividingBy: 1.0)
+
+        let color1 = Color(hue: hue1, saturation: 0.6, brightness: 0.5)
+        let color2 = Color(hue: hue2, saturation: 0.7, brightness: 0.35)
+
+        return LinearGradient(
+            colors: [color1, color2],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    private var titleAndSubtitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(self.item.title)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(width: Self.cardWidth, alignment: .leading)
+
+            if let subtitle = item.subtitle {
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: Self.cardWidth, alignment: .leading)
+            }
+        }
+    }
+}
+
+// MARK: - Preview
+
+#Preview {
+    let manager = FavoritesManager(skipLoad: true)
+    manager.setActiveAccountScopeID("preview")
+    // Add some sample items for preview
+    let song = Song(
+        id: "test",
+        title: "Test Song",
+        artists: [Artist(id: "artist1", name: "Test Artist")],
+        videoId: "test"
+    )
+    manager.add(.from(song))
+
+    let album = Album(
+        id: "MPRE123",
+        title: "Test Album",
+        artists: [Artist(id: "artist1", name: "Test Artist")],
+        thumbnailURL: nil,
+        year: "2024",
+        trackCount: 12
+    )
+    manager.add(.from(album))
+
+    return FavoritesSection()
+        .environment(manager)
+        .environment(PlayerService())
+        .padding()
+}

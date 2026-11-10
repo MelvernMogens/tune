@@ -1,0 +1,82 @@
+# Architecture Decision Records
+
+This directory contains Architecture Decision Records (ADRs) for the Kaset project.
+
+## What is an ADR?
+
+An ADR is a document that captures an important architectural decision made along with its context and consequences. ADRs help:
+
+- **Preserve context** for why decisions were made
+- **Onboard new team members** faster
+- **Avoid repeating discussions** about past decisions
+- **Document trade-offs** considered during design
+
+## Format
+
+Each ADR follows this format:
+
+```markdown
+# ADR-NNNN: Title
+
+## Status
+[Proposed | Accepted | Deprecated | Superseded by ADR-XXXX]
+
+## Context
+What is the issue that we're seeing that is motivating this decision?
+
+## Decision
+What is the change that we're proposing and/or doing?
+
+## Consequences
+What becomes easier or more difficult because of this change?
+```
+
+## Index
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| [0001](0001-webview-playback.md) | WebView-Based Playback | Accepted |
+| [0002](0002-protocol-based-services.md) | Protocol-Based Service Design | Accepted |
+| [0003](0003-modular-api-parsers.md) | Modular API Response Parsers | Accepted |
+| [0004](0004-streaming-foundation-models.md) | Streaming Responses for Foundation Models | Accepted |
+| [0005](0005-foundation-models-architecture.md) | Foundation Models Architecture | Accepted |
+| [0006](0006-swift-testing-migration.md) | Swift Testing Migration | Accepted |
+| [0007](0007-sparkle-auto-updates.md) | Sparkle Auto-Updates | Accepted |
+| [0008](0008-nonisolated-network-helpers.md) | Nonisolated Network Helpers for MainActor Classes | Accepted |
+| [0009](0009-prompt-request-workflow.md) | Prompt Request Workflow | Accepted |
+| [0010](0010-airplay-fix.md) | Fix AirPlay for WebView-Based Playback | Implemented (with known limitations) |
+| [0011](0011-scrobbling-support.md) | Scrobbling Support (Last.fm) | Accepted |
+| [0012](0012-synced-lyrics-architecture.md) | Synced Lyrics Provider Architecture | Accepted |
+| [0013](0013-localization-strategy.md) | Localization Strategy (String Catalogs) | Proposed |
+| [0014](0014-extensions.md) | Extensions — User-Managed Web Extensions | Accepted |
+| [0015](0015-command-bar-local-first-routing.md) | Command Bar Local-First Routing | Accepted |
+| [0016](0016-staged-command-parsing-and-queue-analysis.md) | Staged Command Parsing And Queue Analysis | Accepted |
+| [0017](0017-equalizer.md) | 6-Band Equalizer via Core Audio Process Tap | Implemented |
+| [0018](0018-artist-page-episodes.md) | Artist Page — Episodes, Singles, Playlists, Podcasts, Related Artists | Accepted |
+| [0019](0019-podcasts-availability.md) | Region-Aware Podcasts Tab Visibility | Implemented |
+| [0020](0020-youtube-source-toggle.md) | Native YouTube Client Behind a Source Toggle | Accepted |
+| [0021](0021-liquid-glass-sidebar-slide-under.md) | Liquid Glass Sidebar Slide-Under | Accepted |
+| [0022](0022-youtube-home-sections.md) | YouTube Home Sections — Continue Watching + Personalized Topic Rails | Accepted |
+| [0023](0023-brand-account-history-session-switch.md) | Brand-Account History via WebView Session-Identity Switch | Accepted |
+| [0024](0024-logged-in-guest-mode.md) | Logged-In Guest Mode | Accepted |
+| [0025](0025-smart-shuffle.md) | Smart Shuffle (tri-state shuffle with interleaved recommendations) | Accepted |
+| [0026](0026-generation-scoped-web-playback-bridge.md) | Generation-Scoped Web Playback Bridge Events | Accepted |
+| [0027](0027-native-music-playback-intents-and-queue-entry-identity.md) | Native Music Playback Intents and Queue-Entry Identity | Accepted |
+| [0028](0028-ordered-semantic-music-search-results.md) | Ordered Semantic YouTube Music Search Results | Accepted |
+| [0029](0029-now-playing-tracklist-provider.md) | Shared Now-Playing Mix Tracklist Provider | Accepted |
+| [0030](0030-account-scoped-favorites.md) | Account-Scoped Favorites Persistence | Accepted |
+| [0031](0031-saved-album-library-reconciliation.md) | Saved-Album Library Identity and Reconciliation | Accepted |
+| [0032](0032-youtube-ask-gemini.md) | Watch-Scoped YouTube Ask Gemini | Accepted; fixed WEB profile enabled in production |
+| [0033](0033-login-passkey-suppression.md) | Suppress Passkey Detection in the Login WebView | Accepted |
+| [0034](0034-replace-playback-navigation.md) | Replace Playback Documents Without Growing History | Accepted |
+| [0035](0035-gapless-playback-native-queue.md) | Gapless Playback via YouTube Music Native Queue | Accepted |
+| [0036](0036-music-audio-output-continuity.md) | Music audio output continuity | Accepted |
+| [0037](0037-deferred-cookie-restoration.md) | Deferred cookie restoration | Accepted |
+| [0038](0038-native-appkit-home-shelves.md) | Native AppKit cards for Home-style shelves | Accepted |
+| [0039](0039-shared-item-context-menus.md) | Shared context menus per item type | Accepted |
+| [0040](0040-core-animation-for-repeating-animations.md) | Core Animation for repeating animations | Accepted |
+| [0041](0041-non-destructive-session-loss.md) | Non-destructive session loss | Accepted |
+| [0042](0042-single-now-playing-entry.md) | Single Now Playing entry | Accepted |
+| [0043](0043-single-element-song-transitions.md) | Single-element song transitions (crossfade) | Accepted |
+| [0044](0044-freshen-playback-page-after-long-pause.md) | Freshen the playback page after a long pause | Accepted |
+| [0045](0045-crackle-loudness-trim-and-crossfade-output.md) | Crackle: loudness trim through transitions; no silent AudioContext with crossfade | Accepted |

@@ -1,0 +1,236 @@
+import SwiftUI
+
+// MARK: - MoodCategoryDetailView
+
+/// Detail view for a moods/genres category page.
+/// Displays sections of songs and playlists for the selected mood/genre.
+/// Note: This view is pushed onto an existing NavigationStack, so it uses NavigationLink
+/// to leverage the parent's navigation context.
+struct MoodCategoryDetailView: View {
+    @State var viewModel: MoodCategoryViewModel
+    @Environment(PlayerService.self) private var playerService
+
+    var body: some View {
+        Group {
+            switch self.viewModel.loadingState {
+            case .idle, .loading:
+                LoadingView("Loading \(self.viewModel.category.title)...", showSkeleton: true)
+            case .loaded, .loadingMore:
+                self.contentView
+            case let .error(error):
+                ErrorView(error: error) {
+                    Task { await self.viewModel.refresh() }
+                }
+            }
+        }
+        .navigationTitle(self.viewModel.category.title)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if case .error = self.viewModel.loadingState {} else {
+                PlayerBar()
+            }
+        }
+        .onAppear {
+            if self.viewModel.loadingState == .idle {
+                Task {
+                    await self.viewModel.load()
+                }
+            }
+        }
+        .refreshable {
+            await self.viewModel.refresh()
+        }
+    }
+
+    // MARK: - Views
+
+    @ViewBuilder
+    private var contentView: some View {
+        if self.viewModel.sections.isEmpty {
+            TuneEmptyState(
+                title: String(localized: "No Content Available"),
+                message: String(localized: "No songs or playlists found in this category.")
+            )
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 48) {
+                    ForEach(self.viewModel.sections) { section in
+                        self.sectionView(section)
+                    }
+                }
+                // Edge-to-edge so shelves slide under the glass sidebar;
+                // resting inset is restored per-shelf via contentInset.
+                .padding(.top, 32)
+                .padding(.bottom, TuneTheme.Spacing.scrollEndInset)
+            }
+        }
+    }
+
+    private func sectionView(_ section: HomeSection) -> some View {
+        CarouselShelfSection(
+            accessibilityLabel: section.title,
+            items: section.items,
+            itemAlignment: .top,
+            contentInset: DetailContentLayout.horizontalInset
+        ) {
+            HomeSectionTitleText(title: section.title)
+                .foregroundStyle(TuneTheme.Palette.ink)
+                .padding(.bottom, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(TuneTheme.Palette.rule)
+                        .frame(height: 1)
+                }
+        } itemContent: { item in
+            self.itemView(item)
+        }
+    }
+
+    /// Creates navigation-aware item views.
+    /// Songs use Button (play action), other items use NavigationLink.
+    @ViewBuilder
+    private func itemView(_ item: HomeSectionItem) -> some View {
+        switch item {
+        case let .song(song):
+            // Songs play directly
+            let play: () -> Void = {
+                Task {
+                    await self.playerService.playWithRadio(song: song)
+                }
+            }
+            HomeSectionItemCard(item: item, action: play)
+                .equatable()
+                .contextMenu { self.contextMenu(for: item, play: play) }
+        case let .playlist(playlist):
+            // Playlists navigate using NavigationLink
+            if let parsed = playlist.resolvedMoodCategoryEndpoint {
+                let category = MoodCategory(
+                    browseId: parsed.browseId,
+                    params: parsed.params,
+                    title: playlist.title
+                )
+                NavigationLink(value: category) {
+                    ItemCardContent(item: item)
+                }
+                .buttonStyle(.plain)
+            } else {
+                NavigationLink(value: playlist) {
+                    ItemCardContent(item: item)
+                }
+                .buttonStyle(.plain)
+                .contextMenu { self.contextMenu(for: item) }
+            }
+        case let .album(album):
+            let playlist = Playlist(
+                id: album.id,
+                title: album.title,
+                description: nil,
+                thumbnailURL: album.thumbnailURL,
+                trackCount: album.trackCount,
+                author: Artist.inline(name: album.artistsDisplay, namespace: "album-artist")
+            )
+            NavigationLink(value: playlist) {
+                ItemCardContent(item: item)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { self.contextMenu(for: item) }
+        case let .artist(artist):
+            NavigationLink(value: artist) {
+                ItemCardContent(item: item)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { self.contextMenu(for: item) }
+        }
+    }
+
+    private func contextMenu(for item: HomeSectionItem, play: (() -> Void)? = nil) -> some View {
+        HomeSectionItemContextMenu(item: item, client: self.viewModel.client, play: play)
+    }
+}
+
+// MARK: - ItemCardContent
+
+/// A non-button card view for use inside NavigationLink.
+private struct ItemCardContent: View {
+    let item: HomeSectionItem
+
+    private static let cardWidth: CGFloat = 160
+    private static let cardHeight: CGFloat = 160
+
+    @State private var isHovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            self.thumbnail
+            self.titleAndSubtitle
+        }
+        .scaleEffect(self.isHovering ? 1.02 : 1.0)
+        .shadow(
+            color: self.isHovering ? .black.opacity(0.15) : .clear,
+            radius: self.isHovering ? 12 : 0,
+            x: 0,
+            y: self.isHovering ? 4 : 0
+        )
+        .animation(.spring(duration: 0.2), value: self.isHovering)
+        .onHover { hovering in
+            self.isHovering = hovering
+        }
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            if let url = self.item.thumbnailURL?.highQualityThumbnailURL {
+                CachedAsyncImage(url: url, targetSize: CGSize(width: Self.cardWidth, height: Self.cardHeight)) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    self.placeholderView
+                }
+            } else {
+                self.placeholderView
+            }
+        }
+        .frame(width: Self.cardWidth, height: Self.cardHeight)
+        .clipShape(.rect(cornerRadius: TuneTheme.Radius.artwork, style: .continuous))
+    }
+
+    /// Flat raised placeholder (C2: no hash-colored gradients).
+    private var placeholderView: some View {
+        Rectangle()
+            .fill(TuneTheme.Palette.raised)
+            .overlay {
+                Image(systemName: self.placeholderIcon)
+                    .font(TuneTheme.Typeface.section)
+                    .foregroundStyle(TuneTheme.Palette.inkDim)
+            }
+    }
+
+    private var placeholderIcon: String {
+        switch self.item {
+        case .song: "music.note"
+        case .album: "square.stack"
+        case .playlist: "music.note.list"
+        case .artist: "person.fill"
+        }
+    }
+
+    private var titleAndSubtitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(self.item.displayTitle)
+                .font(TuneTheme.Typeface.body.weight(.medium))
+                .foregroundStyle(TuneTheme.Palette.ink)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(width: Self.cardWidth, alignment: .leading)
+
+            if let subtitle = item.subtitle {
+                Text(TrackDisplayText.cleanByline(subtitle))
+                    .font(TuneTheme.Typeface.body)
+                    .foregroundStyle(TuneTheme.Palette.inkMuted)
+                    .lineLimit(1)
+                    .frame(width: Self.cardWidth, alignment: .leading)
+            }
+        }
+    }
+}

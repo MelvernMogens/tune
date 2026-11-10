@@ -1,0 +1,96 @@
+import SwiftUI
+
+// MARK: - LikeButton
+
+/// One-click thumbs-up toggle that mirrors YouTube Music's per-track like state.
+///
+/// Visibility rules:
+/// - Filled red `hand.thumbsup.fill` is always visible when the song is liked.
+/// - Outline `hand.thumbsup` shows only when `isRowHovered` is true.
+///
+/// The button delegates to `SongActionsHelper.likeSong/unlikeSong` — the same
+/// path used by `LikeDislikeContextMenu`. Tap events do not propagate to the
+/// surrounding row button (`.buttonStyle(.borderless)` plus `.contentShape`
+/// on a tight frame keeps the hit area local).
+///
+/// Borderless buttons are AppKit-backed, though, and one platform view per row
+/// makes long lazy lists drop frames while scrolling. Callers whose LikeButton
+/// is NOT inside another button's label (so nothing relies on borderless click
+/// isolation) pass `isNestedInButton: false` to get a pure-SwiftUI `.plain` button.
+struct LikeButton: View {
+    let song: Song
+    let isRowHovered: Bool
+    var allowsActions = true
+    var isNestedInButton = true
+    @Environment(SongLikeStatusManager.self) private var likeStatusManager
+
+    var body: some View {
+        let isLiked = self.allowsActions && self.likeStatusManager.isLiked(self.song)
+        if self.allowsActions {
+            Button {
+                guard self.allowsActions else { return }
+                HapticService.success()
+                if isLiked {
+                    SongActionsHelper.unlikeSong(self.song, likeStatusManager: self.likeStatusManager)
+                } else {
+                    SongActionsHelper.likeSong(self.song, likeStatusManager: self.likeStatusManager)
+                }
+            } label: {
+                // C2: the filled glyph carries the state; no red (the one accent is
+                // reserved for now playing).
+                Image(systemName: isLiked ? "hand.thumbsup.fill" : "hand.thumbsup")
+                    .font(TuneTheme.Typeface.body)
+                    .foregroundStyle(isLiked ? TuneTheme.Palette.ink : TuneTheme.Palette.inkMuted)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .modifier(LikeButtonStyleModifier(isNestedInButton: self.isNestedInButton))
+            .disabled(!self.allowsActions)
+            .opacity(isLiked || self.isRowHovered ? 1 : 0)
+            .animation(.easeInOut(duration: 0.12), value: isLiked)
+            .animation(.easeInOut(duration: 0.12), value: self.isRowHovered)
+            .accessibilityLabel(Text(
+                isLiked
+                    ? String(localized: "Unlike")
+                    : String(localized: "Like")
+            ))
+            .help(
+                isLiked
+                    ? String(localized: "Unlike")
+                    : String(localized: "Like")
+            )
+        } else {
+            Color.clear
+                .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
+// MARK: - LikeButtonStyleModifier
+
+private struct LikeButtonStyleModifier: ViewModifier {
+    let isNestedInButton: Bool
+
+    func body(content: Content) -> some View {
+        if self.isNestedInButton {
+            content.buttonStyle(.borderless)
+        } else {
+            content.buttonStyle(.plain)
+        }
+    }
+}
+
+// MARK: - HoverObservingRow
+
+/// Wraps a row's body and provides per-row hover state via closure.
+/// Use to drive `LikeButton.isRowHovered` and any other hover-only chrome.
+struct HoverObservingRow<Content: View>: View {
+    @ViewBuilder let content: (Bool) -> Content
+    @State private var isHovered: Bool = false
+
+    var body: some View {
+        self.content(self.isHovered)
+            .onHover { hovering in self.isHovered = hovering }
+    }
+}

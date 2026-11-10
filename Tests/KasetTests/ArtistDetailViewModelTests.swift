@@ -1,0 +1,429 @@
+import Foundation
+import Testing
+@testable import Kaset
+
+/// Tests for ArtistDetailViewModel using mock client.
+extension LibraryMutationSerialTests {
+    @Suite(.tags(.viewModel), .timeLimit(.minutes(1)))
+    @MainActor
+    struct ArtistDetailViewModelTests {
+        var mockClient: MockYTMusicClient
+        var libraryViewModel: LibraryViewModel
+        var viewModel: ArtistDetailViewModel
+
+        init() {
+            self.mockClient = MockYTMusicClient()
+            self.libraryViewModel = LibraryViewModel(client: self.mockClient)
+            let artist = TestFixtures.makeArtist(id: "UC-test-artist", name: "Test Artist")
+            self.viewModel = ArtistDetailViewModel(
+                artist: artist,
+                client: self.mockClient,
+                libraryViewModel: self.libraryViewModel
+            )
+            SongActionsHelper.artistLibraryReconciliationRetryDelays = [.milliseconds(1), .milliseconds(1)]
+        }
+
+        private func awaitArtistReconciliation(refreshes expectedRefreshCount: Int = 1) async {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(1))
+
+            while self.mockClient.getLibraryContentCallCount < expectedRefreshCount {
+                guard clock.now < deadline else { return }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        // MARK: - Initial State Tests
+
+        @Test("Initial state is idle with no artist detail")
+        func initialState() {
+            #expect(self.viewModel.loadingState == .idle)
+            #expect(self.viewModel.artistDetail == nil)
+            #expect(self.viewModel.showAllSongs == false)
+        }
+
+        // MARK: - Load Tests
+
+        @Test("Load success sets artist detail")
+        func loadSuccess() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 10,
+                albumCount: 3,
+                playlistCount: 2,
+                featuredOnPlaylistCount: 1,
+                similarArtistCount: 2
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+
+            #expect(self.mockClient.getArtistCalled == true)
+            #expect(self.mockClient.getArtistIds.first == "UC-test-artist")
+            #expect(self.viewModel.loadingState == .loaded)
+            #expect(self.viewModel.artistDetail != nil)
+            #expect(self.viewModel.artistDetail?.songs.count == 10)
+            #expect(self.viewModel.artistDetail?.orderedSections.map(\.title) == ["Albums", "Featured on", "Playlists", "Similar artists"])
+        }
+
+        @Test("Load error sets error state")
+        func loadError() async {
+            self.mockClient.shouldThrowError = YTMusicError.networkError(underlying: URLError(.notConnectedToInternet))
+
+            await self.viewModel.load()
+
+            #expect(self.mockClient.getArtistCalled == true)
+            if case let .error(error) = viewModel.loadingState {
+                #expect(!error.message.isEmpty)
+                #expect(error.isRetryable)
+            } else {
+                Issue.record("Expected error state")
+            }
+            #expect(self.viewModel.artistDetail == nil)
+        }
+
+        @Test("Load does not duplicate when already loading")
+        func loadDoesNotDuplicateWhenAlreadyLoading() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 5
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            await self.viewModel.load()
+
+            #expect(self.viewModel.loadingState == .loaded)
+        }
+
+        @Test("Load uses original artist info for unknown name")
+        func loadUsesOriginalArtistInfoForUnknownName() async {
+            let originalArtist = TestFixtures.makeArtist(
+                id: "UC-test-artist",
+                name: "Test Artist",
+                profileKind: .profile
+            )
+            let viewModel = ArtistDetailViewModel(
+                artist: originalArtist,
+                client: self.mockClient,
+                libraryViewModel: self.libraryViewModel
+            )
+
+            // Create an artist detail with "Unknown Artist" name
+            let unknownArtist = Artist(
+                id: "UC-test-artist",
+                name: "Unknown Artist",
+                thumbnailURL: nil,
+                profileKind: .unknown
+            )
+            let artistDetail = ArtistDetail(
+                artist: unknownArtist,
+                description: nil,
+                songs: TestFixtures.makeSongs(count: 3),
+                orderedSections: [
+                    ArtistDetailSection(
+                        title: "Singles & EPs",
+                        content: .albums([TestFixtures.makeAlbum(id: "MPRE-single", title: "Single")])
+                    ),
+                    ArtistDetailSection(
+                        title: "Featured on",
+                        content: .playlists([TestFixtures.makePlaylist(id: "VL-featured", title: "Featured Playlist")])
+                    ),
+                    ArtistDetailSection(
+                        title: "Playlists on repeat",
+                        content: .playlists([TestFixtures.makePlaylist(id: "VL-preserved", title: "Preserved Playlist")])
+                    ),
+                    ArtistDetailSection(
+                        title: "Artists on repeat",
+                        content: .artists([TestFixtures.makeArtist(id: "UC-similar", name: "Similar Artist")])
+                    ),
+                ],
+                thumbnailURL: nil,
+                monthlyAudience: "2.59M"
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await viewModel.load()
+
+            // Should use original artist name "Test Artist" instead of "Unknown Artist"
+            #expect(viewModel.artistDetail?.name == "Test Artist")
+            #expect(viewModel.artistDetail?.profileKind == .profile)
+            #expect(viewModel.artistDetail?.monthlyAudience == "2.59M")
+            #expect(viewModel.artistDetail?.orderedSections.map(\.title) == ["Singles & EPs", "Featured on", "Playlists on repeat", "Artists on repeat"])
+        }
+
+        // MARK: - Refresh Tests
+
+        @Test("Refresh clears detail and reloads")
+        func refreshClearsDetailAndReloads() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 5
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            #expect(self.viewModel.artistDetail?.songs.count == 5)
+
+            // Update mock to return different song count
+            let newArtistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 8
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = newArtistDetail
+
+            await self.viewModel.refresh()
+
+            #expect(self.viewModel.artistDetail?.songs.count == 8)
+            #expect(self.viewModel.showAllSongs == false)
+        }
+
+        // MARK: - Displayed Songs Tests
+
+        @Test("displayedSongs returns preview count by default")
+        func displayedSongsReturnsPreviewCount() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 10
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+
+            #expect(self.viewModel.displayedSongs.count == ArtistDetailViewModel.previewSongCount)
+        }
+
+        @Test("displayedSongs returns all songs when showAllSongs is true")
+        func displayedSongsReturnsAllWhenShowAllSongs() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 10
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            self.viewModel.showAllSongs = true
+
+            #expect(self.viewModel.displayedSongs.count == 10)
+        }
+
+        @Test("displayedSongs returns empty when no detail")
+        func displayedSongsReturnsEmptyWhenNoDetail() {
+            #expect(self.viewModel.displayedSongs.isEmpty)
+        }
+
+        // MARK: - Has More Songs Tests
+
+        @Test("hasMoreSongs returns false when no detail")
+        func hasMoreSongsReturnsFalseWhenNoDetail() {
+            #expect(self.viewModel.hasMoreSongs == false)
+        }
+
+        @Test("hasMoreSongs returns true when songs exceed preview count")
+        func hasMoreSongsReturnsTrueWhenExceedsPreview() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 10 // More than previewSongCount
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+
+            #expect(self.viewModel.hasMoreSongs == true)
+        }
+
+        @Test("hasMoreSongs returns false when songs within preview count")
+        func hasMoreSongsReturnsFalseWhenWithinPreview() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 3 // Less than previewSongCount
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+
+            #expect(self.viewModel.hasMoreSongs == false)
+        }
+
+        // MARK: - Subscription Tests
+
+        @Test("toggleSubscription does nothing without channel ID")
+        func toggleSubscriptionNoChannelId() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                description: nil,
+                songs: [],
+                thumbnailURL: nil,
+                channelId: nil // No channel ID
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            await self.viewModel.toggleSubscription()
+
+            #expect(self.mockClient.subscribeToArtistCalled == false)
+            #expect(self.mockClient.unsubscribeFromArtistCalled == false)
+        }
+
+        @Test("toggleSubscription subscribes and refreshes the library")
+        func toggleSubscriptionSubscribes() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "MPLAUC-channel-123", name: "Test Artist"),
+                description: nil,
+                songs: [],
+                thumbnailURL: nil,
+                channelId: "UC-channel-123",
+                isSubscribed: false
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            self.mockClient.reset()
+            await self.viewModel.toggleSubscription()
+            await self.awaitArtistReconciliation()
+
+            #expect(self.mockClient.subscribeToArtistCalled == true)
+            #expect(self.mockClient.subscribeToArtistIds.first == "UC-channel-123")
+            #expect(self.mockClient.getLibraryContentCalled == true)
+            #expect(self.viewModel.artistDetail?.isSubscribed == true)
+            #expect(self.libraryViewModel.libraryArtistIds == Set(["UC-channel-123"]))
+            #expect(self.libraryViewModel.isInLibrary(artistId: "UC-channel-123") == true)
+            #expect(self.libraryViewModel.artists.first?.id == "UC-channel-123")
+        }
+
+        @Test("toggleSubscription keeps optimistic artist when refresh response is stale")
+        func toggleSubscriptionSubscribePreservesOptimisticArtist() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "MPLAUC-channel-123", name: "Test Artist"),
+                description: nil,
+                songs: [],
+                thumbnailURL: nil,
+                channelId: "UC-channel-123",
+                isSubscribed: false
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+            self.mockClient.shouldAutoUpdateArtistLibraryOnMutation = false
+
+            await self.viewModel.load()
+            self.mockClient.reset()
+            await self.viewModel.toggleSubscription()
+            await self.awaitArtistReconciliation(refreshes: 2)
+
+            #expect(self.mockClient.subscribeToArtistCalled == true)
+            #expect(self.mockClient.getLibraryContentCalled == true)
+            #expect(self.viewModel.artistDetail?.isSubscribed == true)
+            #expect(self.libraryViewModel.isInLibrary(artistId: "UC-channel-123") == true)
+            #expect(self.libraryViewModel.artists.first?.id == "UC-channel-123")
+        }
+
+        @Test("toggleSubscription unsubscribes and refreshes the library")
+        func toggleSubscriptionUnsubscribes() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "MPLAUC-channel-123", name: "Test Artist"),
+                description: nil,
+                songs: [],
+                thumbnailURL: nil,
+                channelId: "UC-channel-123",
+                isSubscribed: true
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+            self.mockClient.libraryArtists = [
+                TestFixtures.makeArtist(id: "MPLAUC-channel-123", name: "Test Artist"),
+            ]
+
+            await self.libraryViewModel.load()
+            await self.viewModel.load()
+            self.mockClient.reset()
+            await self.viewModel.toggleSubscription()
+            await self.awaitArtistReconciliation()
+
+            #expect(self.mockClient.unsubscribeFromArtistCalled == true)
+            #expect(self.mockClient.unsubscribeFromArtistIds.first == "UC-channel-123")
+            #expect(self.mockClient.getLibraryContentCalled == true)
+            #expect(self.viewModel.artistDetail?.isSubscribed == false)
+            #expect(self.libraryViewModel.libraryArtistIds.isEmpty)
+            #expect(self.libraryViewModel.isInLibrary(artistId: "UC-channel-123") == false)
+            #expect(self.libraryViewModel.artists.isEmpty)
+        }
+
+        @Test("toggleSubscription sets error on failure")
+        func toggleSubscriptionSetsErrorOnFailure() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                description: nil,
+                songs: [],
+                thumbnailURL: nil,
+                channelId: "UC-channel-123",
+                isSubscribed: false
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            self.mockClient.shouldThrowError = YTMusicError.networkError(underlying: URLError(.notConnectedToInternet))
+
+            await self.viewModel.toggleSubscription()
+
+            #expect(self.viewModel.subscriptionError != nil)
+            #expect(self.viewModel.artistDetail?.isSubscribed == false) // Unchanged
+        }
+
+        // MARK: - Get All Songs Tests
+
+        @Test("getAllSongs returns artist detail songs when no browse ID")
+        func getAllSongsReturnsDetailSongs() async {
+            let artistDetail = TestFixtures.makeArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                songCount: 5
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+
+            await self.viewModel.load()
+            let songs = await self.viewModel.getAllSongs()
+
+            #expect(songs.count == 5)
+            #expect(self.mockClient.getArtistSongsCalled == false)
+        }
+
+        @Test("getAllSongs fetches from API when browse ID available")
+        func getAllSongsFetchesFromAPI() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                description: nil,
+                songs: TestFixtures.makeSongs(count: 5),
+                thumbnailURL: nil,
+                hasMoreSongs: true,
+                songsBrowseId: "artist-songs-browse-id"
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+            self.mockClient.artistSongs["artist-songs-browse-id"] = TestFixtures.makeSongs(count: 20)
+
+            await self.viewModel.load()
+            let songs = await self.viewModel.getAllSongs()
+
+            #expect(songs.count == 20)
+            #expect(self.mockClient.getArtistSongsCalled == true)
+            #expect(self.mockClient.getArtistSongsBrowseIds.first == "artist-songs-browse-id")
+        }
+
+        @Test("getAllSongs returns cached songs on subsequent calls")
+        func getAllSongsReturnsCached() async {
+            let artistDetail = ArtistDetail(
+                artist: TestFixtures.makeArtist(id: "UC-test-artist"),
+                description: nil,
+                songs: TestFixtures.makeSongs(count: 5),
+                thumbnailURL: nil,
+                hasMoreSongs: true,
+                songsBrowseId: "artist-songs-browse-id"
+            )
+            self.mockClient.artistDetails["UC-test-artist"] = artistDetail
+            self.mockClient.artistSongs["artist-songs-browse-id"] = TestFixtures.makeSongs(count: 20)
+
+            await self.viewModel.load()
+            _ = await self.viewModel.getAllSongs()
+            _ = await self.viewModel.getAllSongs()
+
+            // Should only call API once
+            #expect(self.mockClient.getArtistSongsBrowseIds.count == 1)
+        }
+    }
+}

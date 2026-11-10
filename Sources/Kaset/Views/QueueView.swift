@@ -1,0 +1,275 @@
+import SwiftUI
+
+// MARK: - QueueView
+
+/// Right sidebar panel displaying the playback queue.
+struct QueueView: View {
+    @Environment(PlayerService.self) private var playerService
+    @Environment(AuthService.self) private var authService
+    @Environment(\.showCommandBar) private var showCommandBar
+
+    /// Namespace for glass effect morphing.
+    @Namespace private var queueNamespace
+
+    var body: some View {
+        CompatGlassContainer(spacing: 0) {
+            VStack(spacing: 0) {
+                // Header
+                self.headerView
+
+                Divider()
+                    .opacity(0.3)
+
+                // Content
+                self.contentView
+            }
+            .frame(width: 280)
+            .compatGlass(interactive: true, in: .rect(cornerRadius: 20))
+            .compatGlassID("queuePanel", in: self.queueNamespace)
+        }
+        .compatGlassTransition(.materialize)
+        .accessibilityIdentifier(AccessibilityID.Queue.container)
+    }
+
+    // MARK: - Header
+
+    private var headerView: some View {
+        HStack {
+            Text(String(localized: "Up Next"))
+                .font(.headline)
+                .foregroundStyle(.primary)
+
+            Spacer()
+
+            // Clear queue button (only show if there are items beyond the current track)
+            if self.playerService.queue.count > 1 {
+                Button {
+                    self.playerService.clearQueue()
+                } label: {
+                    Text(String(localized: "Clear"))
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(AccessibilityID.Queue.clearButton)
+            }
+
+            Button {
+                self.playerService.toggleQueueDisplayMode()
+            } label: {
+                Label(String(localized: "Edit"), systemImage: "square.and.pencil")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(String(localized: "Open queue in side panel"))
+            .accessibilityLabel(String(localized: "Open queue in side panel"))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+    }
+
+    // MARK: - Content
+
+    @ViewBuilder
+    private var contentView: some View {
+        if self.playerService.queue.isEmpty {
+            self.emptyQueueView
+        } else {
+            self.queueListView
+        }
+    }
+
+    private var emptyQueueView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "list.bullet")
+                .font(.system(size: 40))
+                .foregroundStyle(.tertiary)
+
+            Text(String(localized: "No Queue"))
+                .font(.headline)
+                .foregroundStyle(.secondary)
+
+            Text(String(localized: "Play songs from a playlist or album to build your queue."))
+                .font(.subheadline)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier(AccessibilityID.Queue.emptyState)
+    }
+
+    private var queueListView: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(self.playerService.queueEntries.enumerated()), id: \.element.id) { index, entry in
+                    QueueRowView(
+                        song: entry.song,
+                        isCurrentTrack: index == self.playerService.activePlaybackQueueIndex,
+                        index: index,
+                        isSuggested: entry.source == .suggested,
+                        allowsLikeActions: self.authService.hasPersonalAccount,
+                        playerService: self.playerService,
+                        onRemove: {
+                            self.playerService.removeFromQueue(entryIDs: [entry.id])
+                        },
+                        onTap: {
+                            let reservation = self.playerService.reserveMusicPlaybackIntent()
+                            Task { @MainActor in
+                                guard let intent = self.playerService.claimMusicPlaybackIntent(
+                                    reservation,
+                                    queueEntryID: entry.id
+                                ) else { return }
+                                await self.playerService.playFromQueue(entryID: entry.id, intent: intent)
+                            }
+                        }
+                    )
+                    .accessibilityIdentifier(AccessibilityID.Queue.row(index: index))
+                }
+            }
+            .padding(.vertical, 8)
+        }
+        .accessibilityIdentifier(AccessibilityID.Queue.scrollView)
+    }
+}
+
+// MARK: - QueueRowView
+
+private struct QueueRowView: View {
+    let song: Song
+    let isCurrentTrack: Bool
+    let index: Int
+    let isSuggested: Bool
+    let allowsLikeActions: Bool
+    let playerService: PlayerService
+    let onRemove: () -> Void
+    let onTap: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: self.onTap) {
+            HStack(spacing: 12) {
+                // Now Playing indicator or track number
+                self.leadingIndicator
+                    .frame(width: 24)
+
+                // Thumbnail
+                SongThumbnailView(song: self.song, size: 40, cornerRadius: 4)
+
+                // Track info
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(self.song.displayText.title)
+                            .font(.system(size: 13, weight: self.isCurrentTrack ? .semibold : .regular))
+                            .lineLimit(1)
+                            .foregroundStyle(self.isCurrentTrack ? .red : .primary)
+                        if self.song.isExplicit == true {
+                            ExplicitBadge()
+                        }
+                    }
+
+                    Text(self.song.displayText.artist.isEmpty ? String(localized: "Unknown Artist") : self.song.displayText.artist)
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                // Favorite toggle
+                LikeButton(song: self.song, isRowHovered: self.isHovering, allowsActions: self.allowsLikeActions)
+
+                // Duration
+                if let duration = song.duration {
+                    Text(self.formatDuration(duration))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(self.backgroundColor)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            self.isHovering = hovering
+        }
+        .contextMenu {
+            SongContextMenu(
+                song: self.song,
+                client: self.playerService.ytMusicClient,
+                play: self.isCurrentTrack ? nil : self.onTap,
+                showsGoToArtist: false,
+                showsGoToAlbum: false
+            )
+
+            if !self.isCurrentTrack {
+                Divider()
+
+                Button(role: .destructive) {
+                    self.onRemove()
+                } label: {
+                    Label(String(localized: "Remove from Queue"), systemImage: "minus.circle")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var leadingIndicator: some View {
+        if self.isCurrentTrack {
+            Image(systemName: "waveform")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(self.playerService.isPlaying ? AnyShapeStyle(.red) : AnyShapeStyle(.tertiary))
+                .symbolEffect(
+                    .variableColor.iterative,
+                    options: .repeating,
+                    isActive: self.playerService.isPlaying
+                )
+        } else if self.isSuggested {
+            Image(systemName: "sparkles")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(PackageResourceLookup.brandAccent)
+                .accessibilityLabel(Text(String(localized: "Suggested")))
+        } else {
+            Text("\(self.index + 1)")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var backgroundColor: Color {
+        if self.isCurrentTrack {
+            return Color.red.opacity(0.1)
+        } else if self.isHovering {
+            return Color.primary.opacity(0.05)
+        }
+        return .clear
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return String(format: "%d:%02d", mins, secs)
+    }
+}
+
+#Preview("Queue View") {
+    let playerService = PlayerService()
+    QueueView()
+        .environment(playerService)
+        .environment(FavoritesManager.shared)
+        .frame(height: 600)
+}
+
+#Preview("Queue View with Items") {
+    let playerService = PlayerService()
+    // Note: In real use, queue would be populated via playQueue()
+    QueueView()
+        .environment(playerService)
+        .environment(FavoritesManager.shared)
+        .frame(height: 600)
+}

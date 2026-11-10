@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Verifies the packaged Tune.app has the release-critical settings that are
+# easy to regress when building outside Xcode.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+APP_PATH="$ROOT/.build/app/Tune.app"
+REQUIRE_DEVELOPER_ID=false
+EXPECTED_BUNDLE_ID="com.melvernmogens.Tune"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --require-developer-id)
+      REQUIRE_DEVELOPER_ID=true
+      shift
+      ;;
+    --bundle-id)
+      [[ $# -ge 2 ]] || { echo "ERROR: --bundle-id requires a value" >&2; exit 1; }
+      EXPECTED_BUNDLE_ID="$2"
+      shift 2
+      ;;
+    --help|-h)
+      cat <<USAGE
+Usage: Scripts/verify-release-app.sh [--require-developer-id] [--bundle-id ID] [path/to/Tune.app]
+
+Checks:
+  - the executable (process name) is Tune
+  - Info.plist contains Sparkle's sandboxed installer launcher key
+  - sandbox entitlements include Sparkle's installer/status mach lookups
+  - Sparkle Installer.xpc is embedded
+  - App Intents metadata and App Shortcut phrases are embedded
+  - codesign verification succeeds
+  - optional Developer ID Application signing identity is used
+USAGE
+      exit 0
+      ;;
+    *)
+      APP_PATH="$1"
+      shift
+      ;;
+  esac
+done
+
+INFO_PLIST="$APP_PATH/Contents/Info.plist"
+ENTITLEMENTS_PLIST=$(mktemp "${TMPDIR:-/tmp}/kaset-entitlements.XXXXXX.plist")
+CODESIGN_DETAILS=$(mktemp "${TMPDIR:-/tmp}/kaset-codesign.XXXXXX.txt")
+trap 'rm -f "$ENTITLEMENTS_PLIST" "$CODESIGN_DETAILS"' EXIT
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+[[ -d "$APP_PATH" ]] || fail "App bundle not found: $APP_PATH"
+[[ -f "$INFO_PLIST" ]] || fail "Info.plist not found: $INFO_PLIST"
+
+plutil -lint "$INFO_PLIST" >/dev/null
+
+codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+codesign -d --entitlements :- "$APP_PATH" >"$ENTITLEMENTS_PLIST" 2>/dev/null || fail "Could not read app entitlements"
+plutil -lint "$ENTITLEMENTS_PLIST" >/dev/null
+codesign -dv --verbose=4 "$APP_PATH" >"$CODESIGN_DETAILS" 2>&1 || fail "Could not read code signature details"
+
+python3 - "$APP_PATH" "$INFO_PLIST" "$ENTITLEMENTS_PLIST" "$EXPECTED_BUNDLE_ID" <<'PY'
+import json
+import plistlib
+import sys
+from pathlib import Path
+
+app_path = Path(sys.argv[1])
+info_path = Path(sys.argv[2])
+entitlements_path = Path(sys.argv[3])
+expected_bundle_id = sys.argv[4]
+
+with info_path.open("rb") as handle:
+    info = plistlib.load(handle)
+with entitlements_path.open("rb") as handle:
+    entitlements = plistlib.load(handle)
+
+errors: list[str] = []
+bundle_id = info.get("CFBundleIdentifier")
+if bundle_id != expected_bundle_id:
+    errors.append(f"CFBundleIdentifier must be {expected_bundle_id}, found {bundle_id!r}")
+
+executable = info.get("CFBundleExecutable")
+if executable != "Tune":
+    errors.append(f"CFBundleExecutable must be 'Tune' (the process name users see), found {executable!r}")
+elif not (app_path / "Contents/MacOS" / executable).is_file():
+    errors.append(f"Executable is missing at Contents/MacOS/{executable}")
+
+if info.get("SUEnableInstallerLauncherService") is not True:
+    errors.append("SUEnableInstallerLauncherService must be true for sandboxed Sparkle updates")
+
+installer_xpc = app_path / "Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc"
+if not installer_xpc.exists():
+    errors.append(f"Sparkle Installer.xpc is missing at {installer_xpc}")
+
+# Shortcuts, Siri, and Spotlight discover App Intents only from this generated metadata.
+app_intents_metadata = app_path / "Contents/Resources/Metadata.appintents/extract.actionsdata"
+if not app_intents_metadata.exists():
+    errors.append(f"App Intents metadata is missing at {app_intents_metadata}")
+elif not json.loads(app_intents_metadata.read_text(encoding="utf-8")).get("actions"):
+    errors.append("App Intents metadata declares no actions")
+app_shortcut_phrases = app_path / "Contents/Resources/en.lproj/AppShortcuts.strings"
+if not app_shortcut_phrases.exists():
+    errors.append(f"App Shortcut phrases are missing at {app_shortcut_phrases}")
+
+if entitlements.get("com.apple.security.app-sandbox") is True:
+    expected_mach_services = {
+        f"{expected_bundle_id}-spks",
+        f"{expected_bundle_id}-spki",
+    }
+    actual_mach_services = set(
+        entitlements.get("com.apple.security.temporary-exception.mach-lookup.global-name") or []
+    )
+    missing = sorted(expected_mach_services - actual_mach_services)
+    if missing:
+        errors.append(
+            "Sandboxed Sparkle updates require mach lookup exceptions: "
+            + ", ".join(missing)
+        )
+else:
+    errors.append("Tune release app must be sandboxed")
+
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+if [[ "$REQUIRE_DEVELOPER_ID" == true ]]; then
+  if ! grep -q '^Authority=Developer ID Application:' "$CODESIGN_DETAILS"; then
+    cat "$CODESIGN_DETAILS" >&2
+    fail "Release builds must be signed with a Developer ID Application certificate"
+  fi
+  if grep -q '^Authority=Apple Development:' "$CODESIGN_DETAILS"; then
+    cat "$CODESIGN_DETAILS" >&2
+    fail "Release builds must not be signed with an Apple Development certificate"
+  fi
+fi
+
+echo "✅ Release app verification passed: $APP_PATH"

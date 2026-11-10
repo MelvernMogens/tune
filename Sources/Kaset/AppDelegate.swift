@@ -1,0 +1,398 @@
+import AppKit
+import UserNotifications
+
+extension Notification.Name {
+    /// Posted by `AppDelegate` when the app receives deep-link URLs.
+    static let kasetOpenURLs = Notification.Name("kasetOpenURLs")
+}
+
+// MARK: - AppActivationWindowPolicy
+
+/// Decides whether a generic activation should reveal the main window. Explicit
+/// reopen actions such as the Dock icon and Window → Kaset bypass this policy.
+enum AppActivationWindowPolicy {
+    static func shouldRevealMainWindow(
+        keyWindowIdentifier: String?,
+        mainWindowIdentifier: String?
+    ) -> Bool {
+        !AccessibilityID.isAuxiliaryPlayerWindowIdentifier(keyWindowIdentifier)
+            && !AccessibilityID.isAuxiliaryPlayerWindowIdentifier(mainWindowIdentifier)
+    }
+}
+
+// MARK: - AppDelegate
+
+/// App delegate to control application lifecycle behavior.
+/// Keeps the app running when windows are closed so audio playback continues.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Reference to the PlayerService for dock menu actions.
+    /// Set by KasetApp after initialization.
+    weak var playerService: PlayerService?
+    weak var scrobblingCoordinator: ScrobblingCoordinator?
+
+    /// URLs received before the SwiftUI scene is ready to observe deep links.
+    private var pendingOpenURLs: [URL] = []
+
+    /// True after `KasetApp` starts observing `.kasetOpenURLs`.
+    private var isOpenURLDeliveryReady = false
+
+    /// Reference to the main window for reliable reopen behavior.
+    /// Using strong reference to prevent deallocation when window is hidden.
+    private var mainWindow: NSWindow?
+
+    /// Tracks when the app is quitting so we can allow window closures.
+    private var isTerminating = false
+    private var isPreparingTermination = false
+
+    func applicationWillFinishLaunching(_: Notification) {
+        SettingsManager.shared.appearance.apply()
+    }
+
+    func applicationDidFinishLaunching(_: Notification) {
+        DiagnosticsLogger.app.info("AppDelegate: applicationDidFinishLaunching")
+        // Set up notification center delegate to show notifications in foreground
+        if !UITestConfig.isRunningUnitTests {
+            UNUserNotificationCenter.current().delegate = self
+        }
+
+        // In UI test mode, activate the app to bring window to foreground
+        if UITestConfig.isUITestMode {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+
+        // Register for system sleep/wake notifications
+        self.registerForSleepWakeNotifications()
+
+        // Restore saved queue if available
+        self.playerService?.restoreQueueFromPersistence()
+    }
+
+    func applicationWillTerminate(_: Notification) {
+        // Save queue for persistence on next launch
+        self.playerService?.saveQueueForPersistence()
+        DiagnosticsLogger.player.info("Application will terminate - saved queue for persistence")
+    }
+
+    func applicationShouldTerminate(_ application: NSApplication) -> NSApplication.TerminateReply {
+        self.isTerminating = true
+        guard let scrobblingCoordinator else { return .terminateNow }
+        guard !self.isPreparingTermination else { return .terminateLater }
+
+        self.isPreparingTermination = true
+        Task { @MainActor in
+            await scrobblingCoordinator.prepareForTermination()
+            self.playerService?.saveQueueForPersistence()
+            application.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    /// Registers for system sleep and wake notifications to handle playback appropriately.
+    private func registerForSleepWakeNotifications() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(self.systemWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(self.systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    /// Tracks whether audio was playing before system sleep (for resume on wake).
+    private var wasPlayingBeforeSleep: Bool = false
+
+    @objc private func systemWillSleep(_: Notification) {
+        // Remember playback state and pause before sleep
+        self.wasPlayingBeforeSleep = self.playerService?.isPlaying ?? false
+        if self.wasPlayingBeforeSleep {
+            DiagnosticsLogger.player.info("System going to sleep, pausing playback")
+            SingletonPlayerWebView.shared.pause()
+        }
+    }
+
+    @objc private func systemDidWake(_: Notification) {
+        // Optionally resume playback after wake if it was playing before sleep
+        // Note: We don't auto-resume by default as it could be surprising
+        // Just log the wake event for now
+        DiagnosticsLogger.player.info("System woke from sleep, wasPlayingBeforeSleep: \(self.wasPlayingBeforeSleep)")
+    }
+
+    func applicationDidHide(_: Notification) {
+        MemoryRelief.mainWindowDidHide()
+    }
+
+    func applicationDidResignActive(_: Notification) {
+        // WebKit freezes the page's requestAnimationFrame loop in the background, so the
+        // media-key override (nexttrack/previoustrack) is no longer re-applied and YouTube
+        // can reclaim it. Drive re-assertion from a native timer instead.
+        SingletonPlayerWebView.shared.beginBackgroundMediaControlReassertion()
+    }
+
+    func applicationDidBecomeActive(_: Notification) {
+        // Foreground: the page's requestAnimationFrame loop resumes ownership of the
+        // override. Stop the native timer and re-assert once immediately.
+        SingletonPlayerWebView.shared.endBackgroundMediaControlReassertion()
+        SingletonPlayerWebView.shared.reassertMediaControlOverride()
+        // Generic activation normally reveals the main window, but activation
+        // through an auxiliary player must leave a deliberately hidden main
+        // window alone. Dock-icon reopening is handled explicitly below.
+        if self.isSwitchedToMiniPlayer {
+            if #available(macOS 26.0, *) {
+                MiniPlayerWindowController.shared.orderFrontIfVisible()
+            }
+            return
+        }
+
+        let application = NSApplication.shared
+        guard AppActivationWindowPolicy.shouldRevealMainWindow(
+            keyWindowIdentifier: application.keyWindow?.identifier?.rawValue,
+            mainWindowIdentifier: application.mainWindow?.identifier?.rawValue
+        ) else { return }
+
+        self.showMainWindowIfNeeded()
+    }
+
+    /// Registers the primary SwiftUI window as soon as its root view joins the
+    /// AppKit hierarchy. Window titles follow navigation state, so discovering
+    /// the main window later by title can miss it before the autosave name is set.
+    /// `KasetApp` owns this through a singleton `Window` scene, not a `WindowGroup`.
+    func registerMainWindow(_ window: NSWindow) {
+        guard !self.isAuxiliaryPlayerWindow(window) else { return }
+        window.delegate = self
+        MainWindowLayout.configureKnownPrimaryWindow(window)
+        self.mainWindow = window
+    }
+
+    /// Releases a detached primary scene without disturbing a newer window.
+    func unregisterMainWindow(_ window: NSWindow) {
+        guard self.mainWindow === window else { return }
+        if window.delegate === self {
+            window.delegate = nil
+        }
+        self.mainWindow = nil
+    }
+
+    // MARK: - Dock Menu
+
+    func applicationDockMenu(_: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        // Menu-wide: with auto-enable off, every item must set `isEnabled` itself —
+        // AppKit no longer enables an item just because its target responds to the
+        // action. Required so the Like item can grey out with no track; the transport
+        // items below rely on NSMenuItem's default (enabled). Any future item added
+        // here must set its own isEnabled.
+        menu.autoenablesItems = false
+
+        let playPauseItem = NSMenuItem(
+            title: "Play/Pause",
+            action: #selector(dockMenuPlayPause),
+            keyEquivalent: ""
+        )
+        playPauseItem.target = self
+        menu.addItem(playPauseItem)
+
+        let nextItem = NSMenuItem(
+            title: "Next Track",
+            action: #selector(dockMenuNext),
+            keyEquivalent: ""
+        )
+        nextItem.target = self
+        menu.addItem(nextItem)
+
+        let previousItem = NSMenuItem(
+            title: "Previous Track",
+            action: #selector(dockMenuPrevious),
+            keyEquivalent: ""
+        )
+        previousItem.target = self
+        menu.addItem(previousItem)
+
+        menu.addItem(.separator())
+
+        // Like/Unlike the current track. Title mirrors the player-bar thumbs-up
+        // toggle; disabled when nothing is playing. A disliked track also reads
+        // "Like" — clicking replaces the dislike with a like, matching the player
+        // bar (the dock has no dislike affordance).
+        let canMutateAccount = self.playerService?.canPerformAccountMutation == true
+        let isLiked = canMutateAccount && self.playerService?.currentTrackLikeStatus == .like
+        let likeItem = NSMenuItem(
+            title: isLiked ? String(localized: "Unlike") : String(localized: "Like"),
+            action: #selector(self.dockMenuToggleLike),
+            keyEquivalent: ""
+        )
+        likeItem.target = self
+        likeItem.isEnabled = self.playerService?.currentTrack != nil && canMutateAccount
+        menu.addItem(likeItem)
+
+        return menu
+    }
+
+    @objc private func dockMenuPlayPause() {
+        guard let playerService else {
+            // Fallback to direct WebView control if PlayerService not available
+            SingletonPlayerWebView.shared.playPause()
+            return
+        }
+        Task {
+            await playerService.playPause()
+        }
+    }
+
+    @objc private func dockMenuNext() {
+        guard let playerService else {
+            // Fallback to direct WebView control if PlayerService not available
+            SingletonPlayerWebView.shared.next()
+            return
+        }
+        Task {
+            await playerService.next()
+        }
+    }
+
+    @objc private func dockMenuPrevious() {
+        guard let playerService else {
+            // Fallback to direct WebView control if PlayerService not available
+            SingletonPlayerWebView.shared.previous()
+            return
+        }
+        Task {
+            await playerService.previous()
+        }
+    }
+
+    @objc private func dockMenuToggleLike() {
+        // Like requires the API-backed SongLikeStatusManager, so there is no
+        // WebView-only fallback like the transport actions have.
+        self.playerService?.likeCurrentTrack()
+    }
+
+    /// Keep app running when the window is closed (for background audio).
+    /// Use Cmd+Q to fully quit.
+    /// In UI test mode, terminate normally to avoid process conflicts.
+    func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
+        UITestConfig.isUITestMode
+    }
+
+    /// Handle reopen (clicking dock icon) when all windows are closed.
+    func applicationShouldHandleReopen(_: NSApplication, hasVisibleWindows _: Bool) -> Bool {
+        if self.isSwitchedToMiniPlayer {
+            if #available(macOS 26.0, *) {
+                MiniPlayerWindowController.shared.orderFrontIfVisible()
+            }
+            return false
+        }
+
+        // Show main window when dock icon is clicked
+        self.showMainWindowIfNeeded()
+        return true
+    }
+
+    /// Deep-link entry point for custom URL schemes.
+    func application(_: NSApplication, open urls: [URL]) {
+        DiagnosticsLogger.app.info("AppDelegate: open \(urls.count) URL(s)")
+        self.deliverOpenURLs(urls)
+    }
+
+    /// Call once the main scene is observing `.kasetOpenURLs`.
+    func beginOpenURLDelivery() {
+        self.isOpenURLDeliveryReady = true
+        let pending = self.pendingOpenURLs
+        self.pendingOpenURLs.removeAll()
+        self.deliverOpenURLs(pending)
+    }
+
+    private func deliverOpenURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        if self.isOpenURLDeliveryReady {
+            NotificationCenter.default.post(name: .kasetOpenURLs, object: urls)
+        } else {
+            self.pendingOpenURLs.append(contentsOf: urls)
+        }
+    }
+
+    private var isSwitchedToMiniPlayer: Bool {
+        guard let playerService else { return false }
+        return playerService.isMiniPlayerVisible && playerService.miniPlayerMode == .switchFromMainWindow
+    }
+
+    /// Shows the main window if it's not visible.
+    private func showMainWindowIfNeeded() {
+        DiagnosticsLogger.app.info("AppDelegate: showMainWindowIfNeeded")
+        // Try stored reference first
+        if let mainWindow, MainWindowLayout.isPrimaryWindow(mainWindow) {
+            MainWindowLayout.configure(mainWindow)
+            if !mainWindow.isVisible {
+                mainWindow.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+
+        // Fallback: find main window by frameAutosaveName
+        for window in NSApplication.shared.windows where window.frameAutosaveName == MainWindowLayout.autosaveName {
+            MainWindowLayout.configure(window)
+            self.mainWindow = window
+            if !window.isVisible {
+                window.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+
+        // Last resort: find any main-capable window that's not an auxiliary player window.
+        // Do not apply the primary-window sizing contract here: a generic fallback
+        // may match Settings or another regular scene window.
+        for window in NSApplication.shared.windows where window.canBecomeMain {
+            if self.isAuxiliaryPlayerWindow(window) {
+                continue
+            }
+            if !window.isVisible {
+                window.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+    }
+
+    private func isAuxiliaryPlayerWindow(_ window: NSWindow) -> Bool {
+        AccessibilityID.isAuxiliaryPlayerWindowIdentifier(window.identifier?.rawValue)
+    }
+}
+
+// MARK: NSWindowDelegate
+
+extension AppDelegate: NSWindowDelegate {
+    /// Intercept window close and hide instead, keeping WebView alive for background audio.
+    /// In UI test mode, close normally to avoid process conflicts.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // In UI test mode, allow normal close behavior
+        if UITestConfig.isUITestMode || self.isTerminating {
+            return true
+        }
+
+        // Hide the window instead of closing it
+        sender.orderOut(nil)
+        MemoryRelief.mainWindowDidHide()
+        return false // Don't actually close
+    }
+}
+
+// MARK: UNUserNotificationCenterDelegate
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// Show notifications even when the app is in the foreground.
+    nonisolated func userNotificationCenter(
+        _: UNUserNotificationCenter,
+        willPresent _: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        // Show banner and play sound (if any) even when app is in foreground
+        completionHandler([.banner])
+    }
+}

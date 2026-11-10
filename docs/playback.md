@@ -1,0 +1,779 @@
+# YouTube Music Playback System
+
+This document details Kaset's YouTube Music WebView-based playback system, its architecture, and implementation notes. Regular YouTube video playback is a separate source with its own `YouTubePlayerService` and `YouTubeWatchWebView`; see [YouTube Mode](youtube.md).
+
+## Overview
+
+YouTube Music uses DRM (Widevine) to protect Premium content. Native playback via AVPlayer is not possible because:
+
+1. **Bot Detection**: YouTube's APIs detect non-browser clients and block them
+2. **DRM**: Premium content requires Widevine CDM, only available in WebKit
+3. **User Interaction**: YouTube requires a user gesture to start playback
+
+Our solution: A **singleton WebView** that keeps the YouTube Music app shell alive and plays audio through WebKit's native DRM support. When possible, Kaset uses YouTube Music's in-page router and native **Up Next** queue so track changes avoid full page reloads.
+
+## Architecture
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `SingletonPlayerWebView` | `MiniPlayerWebView.swift` | Manages the one-and-only WebView and router navigation |
+| `SingletonPlayerWebView+PlaybackPreferences` | `SingletonPlayerWebView+PlaybackPreferences.swift` | Installs and refreshes playback preference user scripts |
+| `SingletonPlayerWebView+PlaybackAudioQuality` | `SingletonPlayerWebView+PlaybackAudioQuality.swift` | Applies preferred YouTube audio quality and reports diagnostics |
+| `SingletonPlayerWebView+QueueInjection` | `SingletonPlayerWebView+QueueInjection.swift` | Click-scoped Play Next injection for YouTube Music's native Up Next queue |
+| `PersistentPlayerView` | `MiniPlayerWebView.swift` | SwiftUI wrapper for the WebView |
+| `PlayerService` | `PlayerService.swift` | Playback state and control |
+| `PlayerService+WebPlaybackIdentity` | `PlayerService+WebPlaybackIdentity.swift` | Media-bound identity, native handoff confirmation, and maintenance generations |
+| `PlayerService+WebQueueSync` | `PlayerService+WebQueueSync.swift` | Mirrors Kaset's expected next track into YouTube Music's native queue and reconciles WebView events |
+| `PlayerService+QueueNavigationRecovery` | `PlayerService+QueueNavigationRecovery.swift` | Coalesces bounded recovery loads when stale WebView metadata fights a deterministic queue target |
+| `SingletonPlayerWebView+NavigationState` | `SingletonPlayerWebView+NavigationState.swift` | Tracks the active document navigation and gates document-scoped bridge messages |
+| `AppDelegate` | `AppDelegate.swift` | Window lifecycle for background audio |
+
+### Singleton Pattern
+
+```swift
+@MainActor
+final class SingletonPlayerWebView {
+    static let shared = SingletonPlayerWebView()
+
+    private(set) var webView: WKWebView?
+    var currentVideoId: String?
+
+    func getWebView(webKitManager:, playerService:) -> WKWebView
+    func loadVideo(videoId: String)
+}
+```
+
+**Why Singleton?**
+- Prevents multiple audio streams
+- Survives SwiftUI view recreation
+- Survives window close/reopen
+- Single source of truth for playback
+
+## Playback Flow
+
+### 1. User Initiates Play
+
+```swift
+// In a view
+playerService.play(videoId: "dQw4w9WgXcQ")
+```
+
+This sets:
+- `pendingPlayVideoId` = video ID
+- `showMiniPlayer` = `true` (shows toast for user interaction)
+
+### 2. WebView Preloads
+
+`MainWindow` keeps a hidden `PersistentPlayerView` mounted whenever the user is
+logged in, even before a track is requested. Signed-out users mount the same view
+on demand when public/guest playback creates a pending video. Mounting waits while
+restored playback is deferred, and the hidden view yields ownership to the video
+window while it is open. The hidden view creates the singleton WebView and preloads
+the YouTube Music home page so the app shell and router are ready for playback.
+
+```swift
+if MainWindow.shouldMountPersistentPlayer(
+    isLoggedIn: authService.state.isLoggedIn,
+    pendingVideoId: playerService.pendingPlayVideoId,
+    isPendingRestoredLoadDeferred: playerService.isPendingRestoredLoadDeferred,
+    showVideo: playerService.showVideo
+) {
+    PersistentPlayerView(videoId: playerService.pendingPlayVideoId, isExpanded: false)
+        .frame(width: 1, height: 1)
+        .opacity(0)
+}
+```
+
+Startup preload blocks autoplay unless the user explicitly starts playback. This
+prevents YouTube Music from resuming hidden server-side playback in the 1×1
+WebView.
+
+### 3. Video Starts
+
+`PersistentPlayerView` either:
+
+- creates the singleton WebView and preloads the home page;
+- reuses the existing WebView;
+- asks `SingletonPlayerWebView.loadVideo(videoId:)` to navigate when a pending
+  video should autoload.
+
+`loadVideo(videoId:)` prefers same-document router navigation:
+
+```swift
+app.resolveCommand({ watchEndpoint: { videoId } })
+```
+
+If the router is unavailable, stale, or rejects the command, Kaset falls back to
+loading `https://music.youtube.com/watch?v=<videoId>`. An existing playback
+document uses `window.location.replace` to keep navigation history bounded;
+initial loads use `WKWebView.load`. The router callback is bound to the current
+load generation so an older failed router attempt cannot full-load a stale track
+over a newer request.
+
+### 4. State Updates
+
+The observer script continuously reports:
+- Playback state (`isPlaying`, `progress`, `duration`)
+- Track metadata (`title`, `artist`, `thumbnailUrl`)
+- The logical player `videoId` plus the media-bound `mediaVideoId`
+- `observerEpoch` and `mediaGeneration`, which identify one concrete media occurrence
+- Whether the observer thinks the track changed
+- Like status and lightweight video availability
+- Sanitized audio-quality diagnostics via `PLAYBACK_AUDIO_QUALITY_STATS`
+
+Progress and duration come from the `<video>` element so they remain bound to the
+reported media identity; the player-bar progress DOM is only a fallback. Swift
+filters each document-scoped `STATE_UPDATE` by document, epoch, media generation,
+and expected queue identity before applying it to `PlayerService`. It then uses
+`PlayerService+WebQueueSync` to decide whether the track matches Kaset's queue or
+whether YouTube autoplay needs to be corrected.
+
+Both playback WebViews share `PlaybackAdDetectionScript`. It checks
+`getPresentingPlayerType(true) === 2` on the movie player and Music's `playerApi`,
+with `ad-showing` and `ad-interrupting` player classes as fallbacks. The argument
+includes server-stitched ad segments when the player exposes them. Player ad
+events and class mutations report transitions even while playback is paused.
+API hookup retries every half-second during initialization, stopping when the
+API is ready or after ten seconds.
+These are undocumented player signals and require rechecking when YouTube changes
+its player. Ad inventory or the presence of an ad container does not establish
+that an ad is playing.
+
+Ad samples update transport state while preserving Music's content clock,
+metadata, like status, video availability, and queue. Ad metadata does not consume
+the observer's next content-change notification. After observing a distinct
+creative ID, both players retain ad state across subsequent creatives until the
+requested content returns in metadata and the physical media binding. Ads that
+retain the content ID rely on the player's ad signals.
+End events and recovery seek/resume decisions use the same detector.
+
+Both playback services ignore user and system seek requests during ads. Music
+also rejects a delayed seek snapshot if ad state changed while it was being read.
+The Music mini-player disables its seek slider until content returns.
+
+During ads, both native player bars replace the content timeline with a yellow
+`Ad` badge. Content timestamps and player-bar seeking return when content resumes;
+the selected song or video metadata stays visible throughout the ad.
+
+### 5. Track-End Handling
+
+Natural track completion is handled by a dedicated bridge event:
+
+```javascript
+bridge.postMessage({
+    type: 'TRACK_ENDED',
+    observerEpoch: observerEpoch,
+    documentID: documentID,
+    videoId: mediaIdentityUncertain ? '' : mediaVideoId,
+    mediaGeneration: mediaGeneration,
+    mediaIdentityUncertain: mediaIdentityUncertain
+});
+```
+
+Swift consumes each `(observerEpoch, mediaGeneration)` ended occurrence once and
+validates that its media-bound `videoId` still matches the expected queue song.
+Duplicate or older events therefore cannot double-advance repeated queue entries.
+If an ended `<video>` element is replayed, the observer advances only the occurrence
+generation without prematurely rebinding its media identity.
+
+If Kaset previously confirmed that the expected next song was injected into
+YouTube Music's native **Up Next** queue, `handleTrackEnded(observedVideoId:)`
+lets YouTube Music auto-advance natively and only updates Kaset's queue pointer.
+If injection is missing, stale, or failed, Kaset falls back to deterministic
+`next()` / `play(song:)` navigation instead of trusting the web queue.
+
+Track-end processing waits for native queue maintenance only when no successor has
+been materialized yet. The wait is generation-scoped and wakes when maintenance
+finishes, is canceled/replaced, or either an external edit or maintenance itself
+inserts a usable successor. Queue replacements invalidate stale maintenance, while
+task-local ownership prevents maintenance's own mix/Smart Shuffle mutations from
+canceling their originating task.
+
+### Idle Prompt Guard and Stall Watchdog
+
+YouTube Music arms an "Are you still listening?" prompt (`ytmusic-you-there-renderer`)
+from `configData.youThereData`: once `Date.now() - window._lact` exceeds
+`lactThresholdMs`, it pauses the `<video>` and opens a dialog. `_lact` only advances on
+DOM input, which the hidden playback WebView never receives, so long sessions used to
+stop mid-song without an `ended` event (upstream #280). `SingletonPlayerWebView+IdlePromptGuard`
+installs a document-end script that refreshes an existing `_lact` while Kaset wants
+playback (`__kasetPlaybackSuppressed` / `__kasetBlockAutoplay` both false) and, as a
+fallback, answers a visible prompt's `dialog-confirm` button and resumes the media.
+
+`PlaybackStallWatchdog` (pure decision logic) plus `PlayerService+StallWatchdog` form a
+liveness backstop. A 2 s tick runs only while Kaset intends playback; it classifies
+stuck loads, unstarted targets, finished tracks that never advanced, and frozen clocks,
+then escalates through bounded actions (resume → router retry → full reload → one skip
+→ pause) with cooldowns and a budget that resets only on real progress. It never acts
+on a user pause, mid-track pauses, the video window or click-to-start toast, AirPlay
+clock quirks, or while offline, and re-checks the live media clock before any recovery.
+While actively playing, Kaset holds a `.userInitiatedAllowingIdleSystemSleep` activity
+so App Nap cannot starve transitions; it never blocks idle system sleep.
+
+### Freshening the Page After a Long Pause
+
+The hidden YouTube Music page grows over hours of use and router navigation never releases
+it. After the listener has explicitly paused for 15 minutes on a page at least an hour old,
+`PlayerService+DocumentFreshen` moves the session into the cold-launch deferred-restore state
+and `SingletonPlayerWebView.rebuildForMemoryFreshen()` replaces the WebView with an inert one,
+releasing the old page's WebContent memory. The next Play full-loads the track and seeks back.
+It never runs during playback, ads, AirPlay, video, restores or queue handoffs
+(`PlaybackDocumentFreshenPolicy`). See [ADR-0044](adr/0044-freshen-playback-page-after-long-pause.md).
+
+### Song Transitions (Crossfade)
+
+Settings → Music → Song Transitions offers a **Crossfade** slider (0–12 s, default off) and
+**Fade on Play, Pause & Skip** (default off). With Crossfade on, the next song really overlaps the
+last N seconds: a short-lived second page, the crossfade deck, plays its opening and the main
+element syncs to it after the song change (ADR-0044, `CrossfadeDeckController` /
+`CrossfadeDeckPlanner` / `CrossfadeDeckScript`). Where the deck can't be used (video, AirPlay,
+signed out, repeat-one, …) `WebPlaybackSongTransitions` (document-start script) fades the last N
+seconds out on an equal-power curve and fades the next media in over `min(N, 1.5)` s. It scales only the
+element (`__kasetTargetVolume × gain`); the user's volume, the slider and YouTube's player volume
+keep the base value, and `enforceVolumeNow` enforces the faded value via
+`__kasetTransitionGain()`. No fade runs during ads, on AirPlay, for podcasts, songs no longer than
+3N or unknown/live durations; a seek into the window fades over the time that is left. User
+transport fades go through `SongTransitionTransportGate` (`PlayerService+SongTransitions.swift`);
+internal pauses never fade. See [ADR-0043](adr/0043-single-element-song-transitions.md) and
+[ADR-0044](adr/0044-crossfade-deck.md).
+
+## Track Changing
+
+When the user plays a different track:
+
+1. `pendingPlayVideoId` changes.
+2. SwiftUI updates the active `PersistentPlayerView`.
+3. `SingletonPlayerWebView.loadVideo(videoId:)` pauses the current element,
+   refreshes autoplay/volume bootstrap state, and tries YouTube Music's SPA
+   router.
+   The router script uses `ytmusic-app.resolveCommand` when present, else the app
+   instance's `handleNavigationEndpoint`, else a bubbling `yt-navigate` event
+   (YouTube Music removed `resolveCommand` in Oct 2026).
+4. If router navigation fails and this is still the latest load generation,
+   Kaset falls back to a full watch URL load. The fallback uses
+   `window.location.replace` when a playback document already exists, or
+   `WKWebView.load` for the initial document.
+
+Manual `next()` and `previous()` always update Kaset's local queue state first
+and use deterministic Kaset navigation:
+
+- `next()` advances to the next Kaset queue entry and uses `play(song:)` /
+  `loadVideo(videoId:)` instead of relying on YouTube Music's ambient Next
+  button. This prevents stale web queue state from repeating the current song or
+  jumping backward.
+- `previous()` uses the queue stack / restart-threshold behavior and does not
+  blindly inherit YouTube Music's ambient previous item.
+- Standalone artist episodes remain outside Kaset's local queue and ignore
+  queue-navigation fallthrough.
+
+Native **Up Next** injection is used for natural track-end auto-advance, not for
+manual Next button presses.
+
+Replacement navigation prevents old YouTube watch pages from accumulating in
+WebKit's back-forward/page cache. See
+[ADR-0034](adr/0034-replace-playback-navigation.md) for the measurement and
+tradeoff record.
+
+When the WebView reports a new `videoId`, Kaset treats that as authoritative
+even if the DOM title/artist are still stale. This avoids a race where YouTube
+switches tracks before the player bar text catches up.
+
+## Playback Preferences and Audio Quality
+
+Kaset injects a small set of playback preference scripts into the singleton
+player WebView from `SingletonPlayerWebView+PlaybackPreferences.swift` and
+`SingletonPlayerWebView+PlaybackAudioQuality.swift`.
+
+### Script responsibilities
+
+| Script | Injection timing | Purpose |
+|--------|------------------|---------|
+| Media control bootstrap | document start | Wraps `navigator.mediaSession.setActionHandler` so seek-forward/back commands stay owned by Swift remote-command handlers while next/previous behavior can still be mirrored into the WebView when needed. |
+| Playback audio-quality bootstrap | document start | Stores the preferred `SettingsManager.PlaybackAudioQuality` value on `window.__kasetPlaybackAudioQuality` before YouTube's player finishes booting. |
+| Playback audio-quality override | document end | Finds candidate YouTube player APIs, asks them to use the preferred audio quality, and reports sanitized diagnostics back to Swift. |
+| Playback audio-quality sync | runtime preference changes | Updates `window.__kasetPlaybackAudioQuality` and immediately reapplies the preference if the override script is already installed. |
+
+When either the media-control mode or playback audio-quality setting changes,
+`refreshInstalledUserScripts()` rebuilds the WebView user scripts and also sends
+runtime sync JavaScript to the already-loaded page. This matters because WebKit
+user scripts only affect future document loads; the explicit sync path keeps the
+currently playing song aligned with the new setting.
+
+### Applying the preferred audio quality
+
+The override script probes several YouTube Music player surfaces, currently
+including:
+
+- `document.querySelector('ytmusic-player')`
+- `ytmusic-player.playerApi`
+- `document.getElementById('movie_player')`
+- `window.yt.player`
+
+For each candidate it tries best-effort YouTube player APIs:
+
+```javascript
+playerApi.setAudioQuality(desiredQuality)
+playerApi.setOption('audio', 'quality', desiredQuality)
+playerApi.setOption('audio', 'audioQuality', desiredQuality)
+playerApi.setOption('player', 'audioQuality', desiredQuality)
+playerApi.setOption('player', 'audio_quality', desiredQuality)
+playerApi.setOption('playback', 'audioQuality', desiredQuality)
+playerApi.setOption('playback', 'audio_quality', desiredQuality)
+```
+
+The YouTube-facing values are:
+
+| Kaset setting | YouTube value |
+|---------------|---------------|
+| `.low` | `small` |
+| `.medium` | `medium` |
+| `.high` | `highres` |
+
+YouTube may still choose the final stream based on account entitlement,
+availability, network conditions, or player policy. Treat this path as a
+preference request plus instrumentation, not as a guarantee that YouTube will
+serve a specific stream.
+
+### How to get playback quality info
+
+The audio-quality override script posts a dedicated WebKit bridge message when
+it has a new diagnostic snapshot:
+
+```javascript
+window.webkit.messageHandlers.singletonPlayer.postMessage({
+    type: 'PLAYBACK_AUDIO_QUALITY_STATS',
+    preferred: 'AUDIO_QUALITY_HIGH',
+    desired: 'highres',
+    applied: true,
+    observed: 'AUDIO_QUALITY_HIGH',
+    source: 'statsForNerds.codecs.itag',
+    observedItag: '141',
+    videoId: 's5oSscNIyIs',
+    available: [],
+    stats: { codecs: '0 / mp4a.40.2 (141)' }
+});
+```
+
+Swift handles this in `MiniPlayerWebView.swift` and logs it through
+`DiagnosticsLogger.player` as `Audio quality stats: ...`.
+
+To inspect the latest quality diagnostics while a song is playing, run:
+
+```bash
+/usr/bin/log show --process Kaset --last 10m --style compact --info --debug \
+  | grep 'Audio quality stats'
+```
+
+For a narrower query against Kaset's unified logging subsystem:
+
+```bash
+/usr/bin/log show --process Kaset --last 10m --style compact --info --debug \
+  --predicate 'subsystem == "com.sertacozercan.Kaset"' \
+  | grep 'Audio quality stats'
+```
+
+Example log line:
+
+```text
+Audio quality stats: preferred=AUDIO_QUALITY_HIGH desired=highres applied=true observed=AUDIO_QUALITY_HIGH source=statsForNerds.codecs.itag videoId=s5oSscNIyIs available=[] stats={"codecs":"0 / mp4a.40.2 (141)"}
+```
+
+The most useful fields are:
+
+| Field | Meaning |
+|-------|---------|
+| `preferred` | Kaset's selected playback audio-quality setting. |
+| `desired` | The string Kaset sent to YouTube player APIs. |
+| `applied` | Whether at least one known setter call appeared to succeed. This does not prove YouTube selected that stream. |
+| `observed` | Best available observed quality from player APIs or Stats for Nerds inference. |
+| `source` | Where `observed` came from, for example `movie_player.getAudioQuality` or `statsForNerds.codecs.itag`. |
+| `observedItag` | Inferred audio itag when one was found. This is included in the bridge payload; the compact Swift log focuses on sanitized summary fields. |
+| `videoId` | The current YouTube video id, if available. |
+| `available` | Sanitized result from available-audio-quality player APIs, when exposed. |
+| `stats` | Allowlisted, sanitized Stats for Nerds fields. |
+
+### Stats for Nerds and itag inference
+
+YouTube Music does not expose a stable public API for the selected audio stream.
+The diagnostic path therefore combines several best-effort sources:
+
+1. Direct player getters such as `getAudioQuality()`,
+   `getPlaybackAudioQuality()`, and `getPreferredAudioQuality()`.
+2. Available-quality getters such as `getAvailableAudioQualityLevels()`.
+3. Allowlisted Stats for Nerds fields from `getStatsForNerds()`.
+4. Itag inference from primitive values found in those allowlisted fields.
+
+Current audio itag mapping:
+
+| Itag | Inferred quality |
+|------|------------------|
+| `139`, `249`, `250` | `AUDIO_QUALITY_LOW` |
+| `140`, `251` | `AUDIO_QUALITY_MEDIUM` |
+| `141` | `AUDIO_QUALITY_HIGH` |
+
+Only primitive values and primitive arrays are inspected. The bridge payload is
+throttled and sanitized before logging so that noisy or sensitive player objects
+are not emitted to unified logging.
+
+### Troubleshooting quality diagnostics
+
+- No `Audio quality stats` line: confirm the app was built with the latest
+  `SingletonPlayerWebView+PlaybackAudioQuality.swift`, start a fresh song, and
+  query at least the last 10 minutes of logs.
+- `applied=false`: none of the probed player APIs exposed a usable setter at
+  that moment. The observer will retry on video lifecycle and DOM mutation
+  events.
+- `observed=unknown`: YouTube did not expose a known getter or allowlisted Stats
+  for Nerds value yet. Wait for playback to start or seek/change tracks to cause
+  another snapshot.
+- `preferred` and `observed` differ: YouTube may have ignored the preference,
+  the stream may not be available for that account/video, or the observed value
+  may have been captured before the player settled.
+
+## Background Audio
+
+### Window Close Behavior
+
+By default, closing a window destroys its view hierarchy, killing the WebView. We prevent this:
+
+```swift
+// AppDelegate.swift
+extension AppDelegate: NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)  // Hide instead of close
+        return false          // Don't actually close
+    }
+}
+```
+
+### App Lifecycle
+
+```swift
+func applicationShouldTerminateAfterLastWindowClosed(_:) -> Bool {
+    return false  // Keep app running when window hidden
+}
+```
+
+### Reopening Window
+
+```swift
+func applicationShouldHandleReopen(_:, hasVisibleWindows:) -> Bool {
+    if !hasVisibleWindows {
+        for window in NSApplication.shared.windows where window.canBecomeMain {
+            window.makeKeyAndOrderFront(nil)
+            return true
+        }
+    }
+    return true
+}
+```
+
+### Flow Summary
+
+| Action | Result |
+|--------|--------|
+| Close window (⌘W) | Window hides, audio continues |
+| Click dock icon | Window reappears, same audio |
+| Quit app (⌘Q) | App terminates, audio stops |
+
+## JavaScript Bridge
+
+### Observer Script
+
+Injected into every watch page. The real script is more defensive than the
+minimal version below:
+
+```javascript
+(function() {
+    'use strict';
+    const bridge = window.webkit.messageHandlers.singletonPlayer;
+    let lastTitle = '';
+    let lastArtist = '';
+    let lastVideoId = '';
+
+    function currentVideoId() {
+        const player = document.querySelector('ytmusic-player');
+        const data = player?.playerApi?.getVideoData?.();
+        return data?.video_id || data?.videoId || '';
+    }
+
+    function sendTrackEnded() {
+        bridge.postMessage({
+            type: 'TRACK_ENDED',
+            videoId: lastVideoId || currentVideoId()
+        });
+    }
+
+    function sendUpdate() {
+        const video = document.querySelector('video');
+        const progressBar = document.querySelector('#progress-bar');
+        const title = /* DOM title, or player API title if DOM is stale */;
+        const artist = /* DOM artist, or player API artist if DOM is stale */;
+        const videoId = currentVideoId();
+        const trackChanged =
+            (title !== '' && (title !== lastTitle || artist !== lastArtist))
+            || (videoId !== '' && videoId !== lastVideoId);
+
+        if (trackChanged) {
+            if (title !== '') {
+                lastTitle = title;
+                lastArtist = artist;
+            }
+            if (videoId !== '') {
+                lastVideoId = videoId;
+            }
+        }
+
+        bridge.postMessage({
+            type: 'STATE_UPDATE',
+            isPlaying: video ? !video.paused : false,
+            progress: parseInt(progressBar?.getAttribute('value') || '0'),
+            duration: parseInt(progressBar?.getAttribute('aria-valuemax') || '0'),
+            title: title,
+            artist: artist,
+            videoId: videoId,
+            trackChanged: trackChanged
+        });
+    }
+})();
+```
+
+### Message Handler
+
+```swift
+func userContentController(_:, didReceive message: WKScriptMessage) {
+    guard let body = message.body as? [String: Any],
+          let type = body["type"] as? String
+    else { return }
+
+    Task { @MainActor in
+        if type == "TRACK_ENDED" {
+            await playerService.handleTrackEnded(
+                observedVideoId: body["videoId"] as? String
+            )
+            return
+        }
+
+        playerService.updatePlaybackState(...)
+        playerService.updateTrackMetadata(...)
+    }
+}
+```
+
+### Queue Authority
+
+Kaset treats its own queue as the source of truth whenever one exists:
+- `handleTrackEnded(observedVideoId:)` keeps the outgoing queue entry visible until
+  the expected native next media identity is confirmed
+- `updateTrackMetadata(...)` accepts `videoId`-only transitions even if the DOM
+  metadata is temporarily blank or stale
+- Playback progress/duration is accepted only when the observer's media-bound
+  video ID and generation match the active queue entry; logical metadata changes
+  cannot assign the outgoing media element's near-end state to the next song
+- If YouTube advances to an unexpected track near the end of a song, Kaset
+  replays the expected queue track instead of inheriting YouTube autoplay
+- At the end of a non-repeating queue, Kaset marks playback ended rather than
+  allowing autoplay to continue into unrelated tracks
+- In smart shuffle mode the queue may also contain ephemeral `.suggested`
+  entries, which are stripped before persistence (see [Smart Shuffle](#smart-shuffle))
+
+### Native Web Queue Injection
+
+For gapless-style transitions, Kaset mirrors the current expected next song into
+YouTube Music's native **Up Next** queue:
+
+1. `syncWebQueue()` runs only when playback is stable (`.playing` or `.paused`)
+   and no main-document navigation is in progress.
+2. `SingletonPlayerWebView.injectNextSong(videoId:afterVideoId:)` opens the player-bar menu,
+   waits for the action menu to mount, positively identifies **Play next**, temporarily
+   replaces that item's `queueAddEndpoint` target, invokes its native click path, and
+   immediately restores the endpoint. The source video in the menu endpoint must still
+   match Kaset's current queue song.
+3. The script preserves rendered queue-row occurrences, accepts an already aligned queue without another click, otherwise requires the
+   queue to change after the click, and reports success only when the target is the actual
+   next row. This avoids false confirmation from later duplicate video IDs.
+4. Swift promotes `pendingWebQueueInjectionVideoId` to `injectedWebQueueVideoId`
+   only if that readback result still matches the currently expected next entry.
+5. At natural end, Kaset waits for the media-bound observer to report the same target
+   before moving its visible queue pointer. Unexpected media, a bounded timeout, or
+   changed source/target queue adjacency triggers deterministic navigation to the
+   current expected next entry.
+6. Any deterministic navigation, queue replacement, empty queue persistence, or
+   stale result clears both Swift-side and page-side injection state.
+
+Important invariants:
+
+- A pending injection is not trusted for playback decisions.
+- Injection dispatch never mutates unrelated JSON payloads and fails closed when
+  the source track changes or queue readback does not confirm the expected insertion.
+- Queue readback confirmation authorizes a native handoff attempt; actual queue state
+  advances only after media-bound target confirmation.
+- Duplicate video IDs are handled by clearing the consumed marker so the next
+  queue entry can be injected again.
+- If injection fails, times out, or becomes stale, Kaset prioritizes correctness
+  and falls back to deterministic navigation. This may not be gapless, but it
+  prevents Kaset's UI/persistence from diverging from actual playback.
+
+## Mini Player UI
+
+A small toast in the bottom-right corner:
+
+| State | Size | Purpose |
+|-------|------|---------|
+| Visible | 160×90 | User clicks to interact |
+| Hidden | 1×1 | WebView stays in hierarchy |
+
+```swift
+.frame(
+    width: playerService.showMiniPlayer ? 160 : 1,
+    height: playerService.showMiniPlayer ? 90 : 1
+)
+```
+
+### Auto-Dismiss
+
+When playback starts, the mini player auto-dismisses:
+
+```swift
+// In Coordinator
+if isPlaying && playerService.showMiniPlayer {
+    playerService.confirmPlaybackStarted()
+}
+```
+
+## Common Issues
+
+### Multiple Audio Streams
+
+**Cause**: Multiple WebViews created
+
+**Solution**: Singleton pattern ensures one WebView
+
+### Audio Stops on Window Close
+
+**Cause**: WebView destroyed with view hierarchy
+
+**Solution**: `windowShouldClose` returns `false`, hides instead
+
+### Track Not Changing
+
+**Cause**: `updateNSView` not called
+
+**Solution**: Pass `videoId` as parameter to trigger SwiftUI updates
+
+### No Playback
+
+**Cause**: User interaction required by YouTube
+
+**Solution**: Mini player toast allows user to click play
+
+## User Agent
+
+We use Safari's user agent to avoid "browser not optimized" warnings:
+
+```swift
+static let userAgent = """
+    Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/605.1.15 (KHTML, like Gecko) \
+    Version/17.0 Safari/605.1.15
+    """
+```
+
+## Debugging
+
+Enable WebView inspector in Debug builds:
+
+```swift
+#if DEBUG
+    webView.isInspectable = true
+#endif
+```
+
+Right-click the mini player → "Inspect Element" to debug JavaScript.
+
+## Infinite Mix
+
+When playing artist mixes (`RDEM...` playlists), the app supports infinite queue loading:
+
+### How It Works
+
+1. **Initial Load**: `playWithMix()` fetches ~50 songs via the `next` endpoint
+2. **Continuation Token**: The API returns a `nextRadioContinuationData.continuation` token
+3. **Auto-Fetch**: When ≤10 songs remain in queue, `fetchMoreMixSongsIfNeeded()` loads more
+4. **Duplicate Filter**: New songs are filtered to prevent duplicates
+5. **Repeat**: Process continues until no more continuation tokens
+
+### Key Components
+
+| Component | Purpose |
+|-----------|----------|
+| `RadioQueueResult` | Holds songs + continuation token |
+| `mixContinuationToken` | Stored in `PlayerService` |
+| `isFetchingMoreMixSongs` | Prevents concurrent fetches |
+| `fetchMoreMixSongsIfNeeded()` | Triggered on `next()` and `playFromQueue()` |
+
+### State Reset
+
+The continuation token is cleared when:
+- Playing a regular queue (`playQueue`)
+- Playing song radio (`playWithRadio`)
+- Clearing the queue (`clearQueue`)
+
+This prevents infinite fetch from triggering on non-mix playback.
+
+## Smart Shuffle
+
+Shuffle is tri-state: `enum ShuffleMode { off, on, smart }` on `PlayerService`,
+with a computed `shuffleEnabled: Bool { mode != .off }` shim so existing readers
+(WebQueueSync, UI, scripting) are unchanged. Binary controls (`⌘S`, menu,
+mini-player, AppleScript, AI) only toggle on↔off; only the player-bar control
+cycles `off → on → smart → off`, and it skips `smart` when the feature is
+disabled in Settings. See [ADR-0025](adr/0025-smart-shuffle.md) for the rationale.
+
+### Rolling window
+
+In `smart` mode, `fillSmartShuffleWindow()` (in `PlayerService+SmartShuffle.swift`)
+keeps a configurable number of recommended tracks queued ahead. It is idempotent
+and rolling — it runs when entering smart mode and again on every track advance.
+`nextSuggestionSlot()` scans the upcoming entries for the next gap that still needs
+suggestions; for each slot it seeds `getRadioQueue(videoId:)` from the original
+track *immediately preceding* the slot (so picks stay locally coherent across a
+multi-genre playlist), dedupes candidates by `videoId` against the live queue, and
+inserts up to `burst` entries marked `QueueEntry.source = .suggested`. Because radio
+has no continuation token, the window tops up by re-seeding from later originals
+rather than paginating. Leaving smart mode strips not-yet-played suggestions.
+
+| Setting (`SettingsManager`) | Range / default | Purpose |
+|------------------------------|-----------------|---------|
+| `smartShuffleEnabled` | `Bool`, `true` | Whether the player-bar control can cycle into smart |
+| `smartShuffleSuggestEveryN` | `1...6`, `3` | Insert a suggestion slot every N originals |
+| `smartShuffleBurst` | `1...5`, `1` | Suggestions inserted per slot |
+| `smartShuffleSuggestionsAhead` | `5...100`, `20` | How many suggestions to keep queued ahead |
+
+### Suggestions are ephemeral
+
+Suggested entries are never persisted. `saveQueueForPersistence()` strips
+`.suggested` entries before saving (keeping the currently-playing track so resume
+mid-track works), and the window is regenerated automatically from live playback
+context once a session restores in smart mode (and again on the next advance) —
+avoiding a stale snapshot fighting the rolling window. Suggested tracks carry a
+brand-accent "sparkles" marker on all three queue surfaces (popup, side panel,
+mini player). Disabling Smart Shuffle in Settings stops further top-ups
+immediately, and a persisted `smart` mode falls back to `on` on launch when the
+feature is off.
+
+## Video Mode
+
+For floating video window functionality, see [docs/video.md](video.md).
+
+## Future Improvements
+
+- [x] Queue management (next/previous)
+- [x] Infinite mix loading
+- [x] Smart Shuffle (tri-state shuffle with rolling recommendation window)
+- [x] Video mode (floating video window)
+- [x] Seek support via JavaScript
+- [x] Volume control
+- [x] Now Playing in Control Center (via WKWebView media session + remote commands)

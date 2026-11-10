@@ -1,0 +1,133 @@
+import Foundation
+import Testing
+@testable import Kaset
+
+/// Tests for ExploreViewModel using mock client.
+@Suite(.serialized, .tags(.viewModel), .timeLimit(.minutes(1)))
+@MainActor
+struct ExploreViewModelTests {
+    var mockClient: MockYTMusicClient
+    var viewModel: ExploreViewModel
+
+    init() {
+        self.mockClient = MockYTMusicClient()
+        self.viewModel = ExploreViewModel(client: self.mockClient)
+    }
+
+    @Test("Initial state is idle with empty sections")
+    func initialState() {
+        #expect(self.viewModel.loadingState == .idle)
+        #expect(self.viewModel.sections.isEmpty)
+    }
+
+    @Test("Load success filters out Charts section")
+    func loadSuccess() async {
+        // "Charts" section is filtered out by ExploreViewModel since it's in the sidebar
+        let expectedSections = [
+            TestFixtures.makeHomeSection(title: "New releases"),
+            TestFixtures.makeHomeSection(title: "Charts"),
+            TestFixtures.makeHomeSection(title: "Moods & genres"),
+        ]
+        self.mockClient.exploreResponse = HomeResponse(sections: expectedSections)
+
+        await self.viewModel.load()
+
+        #expect(self.mockClient.getExploreCalled == true)
+        #expect(self.viewModel.loadingState == .loaded)
+        // "Charts" section is filtered out, so we expect 2 sections
+        #expect(self.viewModel.sections.count == 2)
+        #expect(self.viewModel.sections[0].title == "New releases")
+        #expect(self.viewModel.sections[1].title == "Moods & genres")
+    }
+
+    @Test("Load uses Explore endpoint even when personalized recommendations are available")
+    func loadUsesExploreEndpointWhenPersonalizedRecommendationsAreAvailable() async {
+        self.mockClient.personalizedRecommendationsResponse = HomeResponse(sections: [
+            TestFixtures.makeHomeSection(title: "Recommended for you"),
+        ])
+        self.mockClient.exploreResponse = HomeResponse(sections: [
+            TestFixtures.makeHomeSection(title: "Public explore"),
+        ])
+
+        await self.viewModel.load()
+
+        #expect(self.mockClient.getPersonalizedRecommendationsCalled == false)
+        #expect(self.mockClient.getExploreCalled == true)
+        #expect(self.viewModel.sections.map(\.title) == ["Public explore"])
+    }
+
+    @Test("Initial load does not drain explore continuations")
+    func initialLoadDoesNotDrainExploreContinuations() async {
+        self.mockClient.exploreResponse = HomeResponse(sections: [TestFixtures.makeHomeSection(title: "Initial")])
+        self.mockClient.exploreContinuationSections = [[TestFixtures.makeHomeSection(title: "Continuation")]]
+
+        await self.viewModel.load()
+
+        #expect(self.viewModel.sections.map(\.title) == ["Initial"])
+        #expect(self.viewModel.hasMoreSections == true)
+        #expect(self.mockClient.getExploreContinuationCallCount == 0)
+    }
+
+    @Test("Load more appends one filtered explore continuation per demand")
+    func loadMoreAppendsOneFilteredExploreContinuationPerDemand() async {
+        self.mockClient.exploreResponse = HomeResponse(sections: [TestFixtures.makeHomeSection(title: "Initial")])
+        self.mockClient.exploreContinuationSections = [
+            [
+                TestFixtures.makeHomeSection(title: "Charts"),
+                TestFixtures.makeHomeSection(title: "Continuation 1"),
+            ],
+            [TestFixtures.makeHomeSection(title: "Continuation 2")],
+        ]
+
+        await self.viewModel.load()
+        await self.viewModel.loadMore()
+
+        #expect(self.viewModel.sections.map(\.title) == ["Initial", "Continuation 1"])
+        #expect(self.viewModel.hasMoreSections == true)
+        #expect(self.mockClient.getExploreContinuationCallCount == 1)
+
+        await self.viewModel.loadMore()
+
+        #expect(self.viewModel.sections.map(\.title) == ["Initial", "Continuation 1", "Continuation 2"])
+        #expect(self.viewModel.hasMoreSections == false)
+        #expect(self.mockClient.getExploreContinuationCallCount == 2)
+    }
+
+    @Test("Load error sets error state")
+    func loadError() async {
+        self.mockClient.shouldThrowError = YTMusicError.networkError(underlying: URLError(.timedOut))
+
+        await self.viewModel.load()
+
+        #expect(self.mockClient.getExploreCalled == true)
+        if case .error = self.viewModel.loadingState {
+            // Expected
+        } else {
+            Issue.record("Expected error state")
+        }
+        #expect(self.viewModel.sections.isEmpty)
+    }
+
+    @Test("Load does not duplicate when already loading")
+    func loadDoesNotDuplicateWhenAlreadyLoading() async {
+        self.mockClient.exploreResponse = TestFixtures.makeHomeResponse(sectionCount: 1)
+
+        await self.viewModel.load()
+        await self.viewModel.load()
+
+        #expect(self.mockClient.getExploreCallCount == 2)
+    }
+
+    @Test("Refresh clears sections and reloads")
+    func refreshClearsSectionsAndReloads() async {
+        self.mockClient.exploreResponse = TestFixtures.makeHomeResponse(sectionCount: 2)
+        await self.viewModel.load()
+        #expect(self.viewModel.sections.count == 2)
+
+        self.mockClient.exploreResponse = TestFixtures.makeHomeResponse(sectionCount: 4)
+        await self.viewModel.refresh()
+
+        #expect(self.viewModel.sections.count == 4)
+        #expect(self.mockClient.getExploreCallCount == 2)
+    }
+}
